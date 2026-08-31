@@ -1,0 +1,130 @@
+# QCML configuration.
+# Keep this file as the single runtime config until a config loader is added.
+
+app:
+  # PhotoJig capture root.
+  root_path: "C:/Users/SKBA_FA/Documents/VIISAN OfficeCam"
+
+storage:
+  sqlite:
+    # Relative paths are resolved from the project root.
+    path: "photo_jig_vision.db"
+    # Optional shared folder. null means local DB only.
+    shared_path: null
+
+normalization:
+  # No automatic image correction is applied.
+  # Drift above drift_threshold is logged for operator review.
+  bg_confidence_threshold: 0.90
+  min_high_conf_bg_ratio: 0.05
+  drift_threshold: 2.0
+  low_confidence_threshold: 0.60
+  retraining_low_confidence_threshold: 0.20
+
+folder_qc:
+  analysis_id_pattern: "^[A-Z]{3}[0-9]{5}$"
+  cell_folder_pattern: "^cell\\s*#\\d+$"
+
+  date_formats:
+    - "%Y-%m-%d"
+    - "%m-%d-%Y"
+    - "%m-%d-%y"
+
+  valid_image_extensions:
+    - ".jpg"
+    - ".jpeg"
+    - ".png"
+    - ".bmp"
+    - ".tif"
+    - ".tiff"
+
+  customer_codes:
+    H: HKMC
+    F: FORD
+    V: VW
+    E: ESS
+    S: Slate
+    T: Test
+
+  # Required image count per FRONT/BACK folder.
+  # null means no fixed count.
+  image_count_rules:
+    H: 30
+    F: 38
+    V: 23
+    E: 40
+    S: null
+    T: null
+
+crop_engine:
+  crop_angle_tolerance: 4.0
+  size_deviation: 0.02
+  pixel_count_deviation: 0.10
+
+  crop_padding_px: 30
+  source_edge_margin_px: 3
+  source_edge_contact_min_px: 25
+
+  # HSV threshold for white paper background detection.
+  paper_mask_hsv:
+    lower: [0, 0, 200]
+    upper: [180, 50, 255]
+
+  # Reference width / height ratio by customer code.
+  customer_reference_ratios:
+    H: 3.306
+    F: 2.566
+    V: 5.203
+
+ml:
+  model_path: "models/lightgbm"
+  num_threads: -1
+
+  save_mask_images: true
+  png_compression_level: 1
+
+  downsample_factor: 0.75
+  predict_chunk_rows: 250000
+
+  li_salt_zone_threshold: 0.01
+  edge_margin_px: 25
+
+  feature_extraction:
+    feature_set: "baseline"
+    local_residual_sigma_px: 50.0
+    robust_eps: 1.0e-6
+    mm_per_pixel: 1.0
+    edge_band_mm: 5.0
+
+  # Edge override HSV range.
+  edge_hsv_range:
+    lower: [0, 4, 72]
+    upper: [177, 62, 158]
+
+  # Nonactive override HSV range.
+  nonactive_hsv_range:
+    lower: [0, 57, 93]
+    upper: [179, 164, 155]
+
+  training:
+    validation_fraction: 0.2
+    test_fraction: 0.2
+    seed: 0
+
+    num_threads: -1
+    num_boost_round: 300
+    early_stopping_rounds: 30
+
+    learning_rate: 0.03
+    num_leaves: 63
+    max_depth: -1
+    min_data_in_leaf: 20
+
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 0
+
+    lambda_l1: 0.0
+    lambda_l2: 0.0
+    min_gain_to_split: 0.0
+    max_bin: 255

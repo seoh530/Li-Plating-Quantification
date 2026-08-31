@@ -1,0 +1,58 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data and images
+data/
+test_data/
+input/
+output/
+results/
+*_results/
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tif
+*.tiff
+*.csv
+
+# Models
+models/
+*.pkl
+*.pickle
+*.joblib
+*.bin
+*.onnx
+*.pt
+*.pth
+*.ckpt
+
+# Executables and build files
+build/
+dist/
+*.exe
+*.zip
+
+# Logs and databases
+logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets and settings
+.env
+*.env
+
+# OS / IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
