@@ -50,6 +50,7 @@ class _WorkflowItem:
     date_path: Path
     analysis_id: str
     analysis_path: Path
+    work_label: str = ""
     qc_status: str = "UNKNOWN"
     ml_status: str = "UNKNOWN"
     li_salt: str = "-"
@@ -65,6 +66,7 @@ class _ImageTask:
     face: str
     image_num: int
     image_path: Path
+    customer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,12 @@ class _FolderChild:
     path: Path
     is_dir: bool
     is_file: bool
+
+
+class _QuickQCHoldError(RuntimeError):
+    def __init__(self, message: str, failed_item: dict[str, object]) -> None:
+        super().__init__(message)
+        self.failed_item = failed_item
 
 
 class WorkflowTab(ttk.Frame):
@@ -111,6 +119,9 @@ class WorkflowTab(ttk.Frame):
         self._preview_enabled = True
         self._review_entries: list[dict[str, object]] = []
         self._review_index = 0
+        self._qc_fail_entries: list[dict[str, object]] = []
+        self._qc_fail_index = 0
+        self._qc_fail_entry_by_tree_id: dict[str, dict[str, object]] = {}
         self._quick_files: list[Path] = []
         self._quick_tree_by_path: dict[Path, str] = {}
         self._quick_display_by_path: dict[Path, str] = {}
@@ -120,9 +131,11 @@ class WorkflowTab(ttk.Frame):
         self._path_quick_mode = False
         self._quick_path_var = tk.StringVar()
         self._run_qc_var = tk.BooleanVar(value=True)
+        self._only_crop_var = tk.BooleanVar(value=False)
         self._run_ml_var = tk.BooleanVar(value=True)
+        self._customer_var = tk.StringVar(value="ETC")
         self._default_view_mode = "By Folder"
-        self._view_modes = ("By Date", "By Analysis ID", "By Folder")
+        self._view_modes = ("By Date", "By Work Folder", "By Folder")
 
         self._build_ui()
         self._refresh_items()
@@ -143,6 +156,9 @@ class WorkflowTab(ttk.Frame):
         self._model_combo["values"] = model_options
         if model_options:
             self._model_var.set(model_options[0])
+        self._customer_combo["values"] = self._customer_options()
+        if self._customer_var.get() not in self._customer_combo["values"]:
+            self._customer_var.set("ETC")
         if self._mode_var.get() in {"By Tree", "Root Tree"}:
             self._mode_var.set("By Folder")
         self._sync_view_mode_options()
@@ -167,7 +183,7 @@ class WorkflowTab(ttk.Frame):
 
         toolbar = ttk.Frame(self)
         toolbar.grid(row=0, column=0, sticky=tk.EW, padx=10, pady=(10, 6))
-        toolbar.columnconfigure(9, weight=1)
+        toolbar.columnconfigure(10, weight=1)
 
         ttk.Label(toolbar, text="View").grid(row=0, column=0, sticky=tk.W)
         self._mode_var = tk.StringVar(value=self._default_view_mode)
@@ -202,33 +218,40 @@ class WorkflowTab(ttk.Frame):
         self._refresh_btn.grid(row=0, column=4, sticky=tk.W)
         self._run_qc_check = ttk.Checkbutton(
             toolbar,
-            text="QC",
+            text="QC (format/structure + crop/tilt)",
             variable=self._run_qc_var,
             command=self._on_run_qc_toggle,
         )
         self._run_qc_check.grid(row=0, column=5, sticky=tk.W, padx=(10, 0))
+        self._only_crop_check = ttk.Checkbutton(
+            toolbar,
+            text="Only Crop",
+            variable=self._only_crop_var,
+            command=self._on_only_crop_toggle,
+        )
+        self._only_crop_check.grid(row=0, column=6, sticky=tk.W, padx=(8, 0))
         self._run_ml_check = ttk.Checkbutton(
             toolbar,
             text="ML",
             variable=self._run_ml_var,
             command=self._on_run_ml_toggle,
         )
-        self._run_ml_check.grid(row=0, column=6, sticky=tk.W, padx=(8, 0))
+        self._run_ml_check.grid(row=0, column=7, sticky=tk.W, padx=(8, 0))
         self._run_btn = ttk.Button(
             toolbar,
             text="Run",
             command=self._run_workflow,
         )
-        self._run_btn.grid(row=0, column=7, sticky=tk.W, padx=(8, 0))
+        self._run_btn.grid(row=0, column=8, sticky=tk.W, padx=(8, 0))
         self._stop_btn = ttk.Button(
             toolbar,
             text="Stop",
             command=self._request_stop,
             state=tk.DISABLED,
         )
-        self._stop_btn.grid(row=0, column=8, sticky=tk.W, padx=(8, 0))
+        self._stop_btn.grid(row=0, column=9, sticky=tk.W, padx=(8, 0))
         self._status_label = ttk.Label(toolbar, text="", foreground="#555555")
-        self._status_label.grid(row=0, column=9, sticky=tk.W, padx=(12, 0))
+        self._status_label.grid(row=0, column=10, sticky=tk.W, padx=(12, 0))
 
         ttk.Label(toolbar, text="Model").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
         self._model_var = tk.StringVar()
@@ -244,6 +267,18 @@ class WorkflowTab(ttk.Frame):
         )
         self._model_combo.grid(row=1, column=1, columnspan=3, sticky=tk.W, padx=(6, 12), pady=(6, 0))
         self._model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
+        ttk.Label(toolbar, text="Customer").grid(row=1, column=4, sticky=tk.W, pady=(6, 0))
+        self._customer_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self._customer_var,
+            values=self._customer_options(),
+            state="readonly",
+            width=18,
+        )
+        self._customer_combo.grid(row=1, column=5, columnspan=3, sticky=tk.W, padx=(6, 12), pady=(6, 0))
+        self._customer_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_items())
+        if not self._customer_var.get():
+            self._customer_var.set("ETC")
         self._build_quick_run_ui()
 
         paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -258,7 +293,7 @@ class WorkflowTab(ttk.Frame):
         self._tree = ttk.Treeview(left, columns=columns, show="headings", selectmode="extended")
         headings = {
             "date": "Date",
-            "analysis_id": "Analysis ID",
+            "analysis_id": "Work Folder",
             "qc": "QC",
             "ml": "ML / DB",
             "li_salt": "Li-salt %",
@@ -348,13 +383,16 @@ class WorkflowTab(ttk.Frame):
             tk.Label(legend, width=2, bg=color, relief=tk.GROOVE).pack(side=tk.LEFT)
             ttk.Label(legend, text=text).pack(side=tk.LEFT, padx=(4, 12))
 
-        review = ttk.LabelFrame(right, text="Before / After Review", padding=8)
-        review.grid(row=3, column=0, sticky=tk.NSEW)
+        self._review_notebook = ttk.Notebook(right)
+        self._review_notebook.grid(row=3, column=0, sticky=tk.NSEW)
+
+        review = ttk.Frame(self._review_notebook, padding=8)
+        self._review_notebook.add(review, text="Review")
         review.columnconfigure(0, weight=1)
         review.rowconfigure(2, weight=1)
         review.rowconfigure(3, weight=1)
 
-        self._review_label = ttk.Label(review, text="Select an AnalysisID to preview.")
+        self._review_label = ttk.Label(review, text="Select a work folder to preview.")
         self._review_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 6))
         review_nav = ttk.Frame(review)
         review_nav.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
@@ -393,6 +431,64 @@ class WorkflowTab(ttk.Frame):
         self._before_canvas.grid(row=2, column=0, sticky=tk.NSEW, pady=(0, 5))
         self._after_canvas = tk.Canvas(review, bg=_PREVIEW_BG, height=165, highlightthickness=1)
         self._after_canvas.grid(row=3, column=0, sticky=tk.NSEW, pady=(5, 0))
+
+        qc_fail = ttk.Frame(self._review_notebook, padding=8)
+        self._qc_fail_tab = qc_fail
+        self._review_notebook.add(qc_fail, text="QC Failures")
+        qc_fail.columnconfigure(0, weight=1)
+        qc_fail.rowconfigure(2, weight=1)
+        qc_fail.rowconfigure(3, weight=1)
+        self._qc_fail_tree = ttk.Treeview(
+            qc_fail,
+            columns=("image", "reason"),
+            show="headings",
+            height=4,
+            selectmode="browse",
+        )
+        self._qc_fail_tree.heading("image", text="Image")
+        self._qc_fail_tree.heading("reason", text="Reason")
+        self._qc_fail_tree.column("image", width=320, anchor=tk.W)
+        self._qc_fail_tree.column("reason", width=440, anchor=tk.W)
+        self._qc_fail_tree.tag_configure("qc_fail", background="#fee2e2")
+        self._qc_fail_tree.grid(row=0, column=0, sticky=tk.EW)
+        self._qc_fail_tree.bind("<<TreeviewSelect>>", self._on_qc_fail_select)
+        qc_fail_nav = ttk.Frame(qc_fail)
+        qc_fail_nav.grid(row=1, column=0, sticky=tk.EW, pady=(6, 6))
+        qc_fail_nav.columnconfigure(0, weight=1)
+        self._qc_fail_count_label = ttk.Label(qc_fail_nav, text="", foreground="#555555")
+        self._qc_fail_count_label.grid(row=0, column=0, sticky=tk.W)
+        self._prev_qc_fail_btn = ttk.Button(
+            qc_fail_nav,
+            text="Previous",
+            command=self._show_previous_qc_fail,
+            state=tk.DISABLED,
+        )
+        self._prev_qc_fail_btn.grid(row=0, column=1, sticky=tk.E, padx=(0, 6))
+        self._next_qc_fail_btn = ttk.Button(
+            qc_fail_nav,
+            text="Next",
+            command=self._show_next_qc_fail,
+            state=tk.DISABLED,
+        )
+        self._next_qc_fail_btn.grid(row=0, column=2, sticky=tk.E)
+        self._retake_qc_fail_btn = ttk.Button(
+            qc_fail_nav,
+            text="Retake done",
+            command=lambda: self._process_current_qc_fail_ng(force=False),
+            state=tk.DISABLED,
+        )
+        self._retake_qc_fail_btn.grid(row=0, column=3, sticky=tk.E, padx=(10, 6))
+        self._crop_qc_fail_btn = ttk.Button(
+            qc_fail_nav,
+            text="Crop anyway",
+            command=lambda: self._process_current_qc_fail_ng(force=True),
+            state=tk.DISABLED,
+        )
+        self._crop_qc_fail_btn.grid(row=0, column=4, sticky=tk.E)
+        self._qc_fail_before_canvas = tk.Canvas(qc_fail, bg=_PREVIEW_BG, height=150, highlightthickness=1)
+        self._qc_fail_before_canvas.grid(row=2, column=0, sticky=tk.NSEW, pady=(0, 5))
+        self._qc_fail_after_canvas = tk.Canvas(qc_fail, bg=_PREVIEW_BG, height=150, highlightthickness=1)
+        self._qc_fail_after_canvas.grid(row=3, column=0, sticky=tk.NSEW, pady=(5, 0))
         self.bind_all("<Tab>", self._on_review_tab_key, add="+")
 
     def _build_quick_run_ui(self) -> None:
@@ -446,6 +542,9 @@ class WorkflowTab(ttk.Frame):
         self._quick_tree.column("file", width=360, anchor=tk.W)
         self._quick_tree.column("status", width=160, anchor=tk.W)
         self._quick_tree.column("output", width=480, anchor=tk.W)
+        self._quick_tree.tag_configure("quick_fail", background="#fee2e2")
+        self._quick_tree.tag_configure("quick_running", background="#fef9c3")
+        self._quick_tree.tag_configure("quick_pass", background="#dbeafe")
         self._quick_tree.grid(row=2, column=0, columnspan=5, sticky=tk.EW, pady=(6, 0))
 
         quick_scroll = ttk.Scrollbar(quick, orient=tk.VERTICAL, command=self._quick_tree.yview)
@@ -478,11 +577,11 @@ class WorkflowTab(ttk.Frame):
     def _on_mode_change(self, _event=None) -> None:
         if self._is_folder_mode():
             self._run_qc_var.set(True)
+            self._only_crop_var.set(False)
             self._run_ml_var.set(True)
-        elif not self._run_qc_var.get() and self._run_ml_var.get():
-            self._run_qc_var.set(True)
         if not self._is_folder_mode():
             self._path_quick_mode = False
+        self._sync_run_mode_controls(not self._running)
         self._refresh_items()
 
     def _is_folder_mode(self) -> bool:
@@ -686,10 +785,10 @@ class WorkflowTab(ttk.Frame):
         ml_done = 0
         for image_path in image_paths:
             crop_path, mask_path, csv_path = self._quick_output_paths(image_path)
-            conventional_crop_path, conventional_mask_path = self._conventional_outputs_for_image(image_path)
-            if crop_path.exists() or conventional_crop_path.exists():
+            conventional_crop_paths, conventional_mask_paths = self._conventional_outputs_for_image(image_path)
+            if crop_path.exists() or any(path.exists() for path in conventional_crop_paths):
                 crop_done += 1
-            if mask_path.exists() or csv_path.exists() or conventional_mask_path.exists():
+            if mask_path.exists() or csv_path.exists() or any(path.exists() for path in conventional_mask_paths):
                 ml_done += 1
         return self._pass_mask_status(
             total=len(image_paths),
@@ -740,13 +839,13 @@ class WorkflowTab(ttk.Frame):
 
     def _image_processing_status(self, image_path: Path) -> tuple[str, str]:
         crop_path, mask_path, csv_path = self._quick_output_paths(image_path)
-        conventional_crop, conventional_mask = self._conventional_outputs_for_image(image_path)
-        if mask_path.exists() or csv_path.exists() or conventional_mask.exists():
+        conventional_crops, conventional_masks = self._conventional_outputs_for_image(image_path)
+        if mask_path.exists() or csv_path.exists() or any(path.exists() for path in conventional_masks):
             return self._append_li_salt_status(
                 "MASK done",
                 self._li_salt_for_image(image_path, csv_path),
             ), "folder_done"
-        if crop_path.exists() or conventional_crop.exists():
+        if crop_path.exists() or any(path.exists() for path in conventional_crops):
             return "MASK missing", "folder_partial"
         return "PASS missing", "folder_fail"
 
@@ -835,7 +934,7 @@ class WorkflowTab(ttk.Frame):
         for face_name, source_path in sources:
             images = self._source_images(source_path)
             total += len(images)
-            pass_count += len(self._pass_pngs(source_path.parent / f"{face_name}_pass"))
+            pass_count += len(self._pass_pngs(self._pass_output_folder(face_name, source_path)))
             mask_count += len(self._mask_pngs(source_path.parent / f"{face_name}_mask"))
             mask_count += len(self._mask_pngs(source_path.parent / f"{face_name}_masks"))
         return total, pass_count, mask_count
@@ -853,13 +952,15 @@ class WorkflowTab(ttk.Frame):
         return bool(re.match(r"^[A-Z]{3}[0-9]{5}$", folder_name)) or is_test_analysis_id(folder_name)
 
     def _li_salt_for_image_folder(self, folder_path: Path, image_paths: list[Path]) -> str:
-        values = [
-            self._li_salt_summary(self._quick_result_csv_for_source(image_path))
-            for image_path in image_paths
-        ]
-        numeric_values = [value for value in values if value != "-"]
-        if numeric_values:
-            return numeric_values[0] if len(set(numeric_values)) == 1 else "mixed"
+        values = []
+        for image_path in image_paths:
+            value = self._li_salt_percent_from_summary(
+                self._li_salt_summary(self._quick_result_csv_for_source(image_path))
+            )
+            if value is not None:
+                values.append(value)
+        if values:
+            return f"{self._format_li_salt_percent(sum(values) / len(values))}%"
         return self._li_salt_summary(self._result_csv_for_folder(folder_path))
 
     def _li_salt_for_image(self, image_path: Path, quick_csv_path: Path) -> str:
@@ -868,12 +969,25 @@ class WorkflowTab(ttk.Frame):
             return li_salt
         return self._li_salt_summary(self._result_csv_for_folder(image_path.parent))
 
-    def _conventional_outputs_for_image(self, image_path: Path) -> tuple[Path, Path]:
+    def _conventional_outputs_for_image(self, image_path: Path) -> tuple[list[Path], list[Path]]:
         source_folder = image_path.parent
-        face_name = source_folder.name
-        crop_path = source_folder.parent / f"{face_name}_pass" / f"{image_path.stem}.png"
-        mask_path = source_folder.parent / f"{face_name}_mask" / f"{image_path.stem}_mask.png"
-        return crop_path, mask_path
+        face_name = source_folder.name if source_folder.name.upper() in {"FRONT", "BACK"} else "FRONT"
+        crop_paths = [
+            self._pass_output_folder(face_name, source_folder) / f"{image_path.stem}.png",
+            *[
+                folder / f"{image_path.stem}.png"
+                for folder in self._work_pass_folder_candidates(source_folder)
+            ],
+        ]
+        mask_paths = [
+            source_folder.parent / f"{face_name}_mask" / f"{image_path.stem}_mask.png",
+            source_folder.parent / f"{face_name}_MASK" / f"{image_path.stem}_mask.png",
+            *[
+                folder / f"{image_path.stem}_mask.png"
+                for folder in self._work_mask_folder_candidates(source_folder)
+            ],
+        ]
+        return self._unique_paths(crop_paths), self._unique_paths(mask_paths)
 
     def _has_root_tree_child(self, folder_path: Path) -> bool:
         try:
@@ -1073,15 +1187,14 @@ class WorkflowTab(ttk.Frame):
     def _list_date_folders(self) -> list[str]:
         if not self._root_path.exists():
             return []
-        dated: list[tuple[datetime, str]] = []
+        folders: list[tuple[bool, datetime, str]] = []
         for path in self._root_path.iterdir():
             if not path.is_dir():
                 continue
             parsed = self._parse_date_folder(path.name)
-            if parsed is not None:
-                dated.append((parsed, path.name))
-        dated.sort(key=lambda item: item[0], reverse=True)
-        return [name for _, name in dated]
+            folders.append((parsed is not None, parsed or datetime.min, path.name))
+        folders.sort(key=lambda item: (item[0], item[1], item[2].lower()), reverse=True)
+        return [name for _valid, _parsed, name in folders]
 
     def _parse_date_folder(self, folder_name: str) -> datetime | None:
         for fmt in self._date_formats:
@@ -1093,6 +1206,21 @@ class WorkflowTab(ttk.Frame):
 
     def _is_analysis_folder(self, folder_name: str) -> bool:
         return bool(self._analysis_id_re.match(folder_name)) or is_test_analysis_id(folder_name)
+
+    def _customer_options(self) -> list[str]:
+        options = ["ETC"]
+        for code, name in sorted(self._customer_codes.items()):
+            if code.upper() in {"T"}:
+                continue
+            options.append(f"{code} - {name}")
+        return options
+
+    def _selected_customer_code(self) -> str:
+        value = getattr(self, "_customer_var", None)
+        text = value.get().strip() if value is not None else "ETC"
+        if not text:
+            return "ETC"
+        return text.split(" - ", 1)[0].strip().upper()
 
     def _refresh_items(self, *, clear_cache: bool = False) -> None:
         self._sync_mode_view()
@@ -1118,19 +1246,43 @@ class WorkflowTab(ttk.Frame):
         self._date_var.set(selected_date)
         self._date_combo.config(
             state=tk.DISABLED
-            if self._running or self._mode_var.get() == "By Analysis ID"
+            if self._running or self._mode_var.get() == "By Work Folder"
             else "readonly"
         )
 
         targets = self._scan_targets(selected_date)
-        self._items = [self._build_item(date_name, date_path, analysis_id) for date_name, date_path, analysis_id in targets]
+        self._items = [
+            self._build_item(date_name, date_path, work_id, work_path)
+            for date_name, date_path, work_id, work_path in targets
+        ]
         self._render_tree()
-        self._status_label.config(text=f"{len(self._items)} AnalysisID(s)")
+        if selected_date and self._parse_date_folder(selected_date) is None:
+            self._status_label.config(text=f"Fail: invalid date folder ({selected_date})")
+        elif selected_date and not self._items:
+            self._status_label.config(text="Fail: no image work folder found")
+        else:
+            self._status_label.config(text=f"{len(self._items)} work folder(s)")
         self._sync_run_mode_controls(not self._running)
 
-    def _refresh_item_status(self, date_name: str, date_path: Path, analysis_id: str) -> None:
-        key = f"{date_name}|{analysis_id}"
-        updated = self._build_item(date_name, date_path, analysis_id)
+    def _refresh_item_status(
+        self,
+        date_name: str,
+        date_path: Path,
+        analysis_id: str,
+        analysis_path: Path | None = None,
+    ) -> None:
+        if analysis_path is None:
+            existing = next(
+                (
+                    item
+                    for item in self._items
+                    if item.date_name == date_name and item.analysis_id == analysis_id
+                ),
+                None,
+            )
+            analysis_path = existing.analysis_path if existing else date_path / analysis_id
+        key = self._work_item_key(date_name, analysis_path)
+        updated = self._build_item(date_name, date_path, analysis_id, analysis_path)
         found = False
         for index, item in enumerate(self._items):
             if item.key == key:
@@ -1143,10 +1295,10 @@ class WorkflowTab(ttk.Frame):
             self._render_tree()
         else:
             self._update_tree_item(updated)
-        self._status_label.config(text=f"{len(self._items)} AnalysisID(s)")
+        self._status_label.config(text=f"{len(self._items)} work folder(s)")
 
-    def _scan_targets(self, selected_date: str) -> list[tuple[str, Path, str]]:
-        targets: list[tuple[str, Path, str]] = []
+    def _scan_targets(self, selected_date: str) -> list[tuple[str, Path, str, Path]]:
+        targets: list[tuple[str, Path, str, Path]] = []
         date_names = self._list_date_folders()
         if self._mode_var.get() == "By Date":
             date_names = [selected_date] if selected_date else []
@@ -1154,21 +1306,72 @@ class WorkflowTab(ttk.Frame):
             date_path = self._root_path / date_name
             if not date_path.is_dir():
                 continue
-            for path in sorted(date_path.iterdir(), key=lambda p: p.name):
-                if path.is_dir() and self._is_analysis_folder(path.name):
-                    targets.append((date_name, date_path, path.name))
-        if self._mode_var.get() == "By Analysis ID":
+            for work_path in self._work_folders_for_date(date_path):
+                targets.append(
+                    (
+                        date_name,
+                        date_path,
+                        self._work_analysis_id(date_path, work_path),
+                        work_path,
+                    )
+                )
+        if self._mode_var.get() == "By Work Folder":
             targets.sort(key=lambda item: (item[2], item[0]))
         return targets
 
-    def _build_item(self, date_name: str, date_path: Path, analysis_id: str) -> _WorkflowItem:
-        analysis_path = date_path / analysis_id
-        key = f"{date_name}|{analysis_id}"
-        qc_ok, qc_summary = self._qc_output_status(analysis_path, analysis_id)
+    def _work_folders_for_date(self, date_path: Path) -> list[Path]:
+        work_folders: list[Path] = []
+        stack = [
+            child
+            for child in sorted(date_path.iterdir(), key=lambda path: path.name.lower())
+            if child.is_dir() and not self._is_output_folder(child)
+        ]
+        while stack:
+            folder_path = stack.pop(0)
+            if self._is_output_folder(folder_path):
+                continue
+            if self._source_images(folder_path):
+                work_folders.append(folder_path)
+            try:
+                children = [
+                    child
+                    for child in sorted(folder_path.iterdir(), key=lambda path: path.name.lower())
+                    if child.is_dir() and not self._is_output_folder(child)
+                ]
+            except OSError:
+                children = []
+            stack[0:0] = children
+        return work_folders
+
+    def _work_label(self, date_path: Path, work_path: Path) -> str:
+        try:
+            return work_path.relative_to(date_path).as_posix()
+        except ValueError:
+            return work_path.name
+
+    def _work_analysis_id(self, date_path: Path, work_path: Path) -> str:
+        raw = f"{date_path.name}_{self._work_label(date_path, work_path)}"
+        value = re.sub(r"[^A-Za-z0-9_]+", "_", raw).strip("_")
+        return value[:120] or "WORK"
+
+    def _work_item_key(self, date_name: str, work_path: Path) -> str:
+        return f"{date_name}|{work_path.resolve(strict=False)}"
+
+    def _build_item(
+        self,
+        date_name: str,
+        date_path: Path,
+        analysis_id: str,
+        analysis_path: Path,
+    ) -> _WorkflowItem:
+        key = self._work_item_key(date_name, analysis_path)
+        work_label = self._work_label(date_path, analysis_path)
+        qc_status, qc_summary = self._qc_output_status(date_name, date_path, analysis_path)
         held = self._held_qc_failures.get(key) or self._load_qc_hold_state(
             date_name,
             date_path,
             analysis_id,
+            analysis_path,
         )
         csv_path = self._find_result_csv(analysis_path, analysis_id)
         cells = self._analysis_cells_from_files(analysis_id, analysis_path)
@@ -1181,18 +1384,18 @@ class WorkflowTab(ttk.Frame):
             failed_count = len(held.get("failures", []))
             ml_status = "WAIT"
             summary = f"QC hold: {failed_count} NG image(s)"
-        elif not qc_ok:
+        elif not self._qc_allows_ml(qc_status):
             ml_status = "WAIT"
             summary = qc_summary
         elif csv_path is None:
             ml_status = "ML missing"
-            summary = "QC ready, ML result missing"
+            summary = qc_summary if qc_status == "Warning" else "QC ready, ML result missing"
         elif not db_complete:
             ml_status = "DB missing"
             summary = "CSV exists, SQLite rows missing"
         else:
             ml_status = "DONE"
-            summary = "QC + ML + DB complete"
+            summary = qc_summary if qc_status == "Warning" else "QC + ML + DB complete"
 
         return _WorkflowItem(
             key=key,
@@ -1200,7 +1403,8 @@ class WorkflowTab(ttk.Frame):
             date_path=date_path,
             analysis_id=analysis_id,
             analysis_path=analysis_path,
-            qc_status="HOLD" if held else ("DONE" if qc_ok else "NEEDED"),
+            work_label=work_label,
+            qc_status="Hold" if held else qc_status,
             ml_status=ml_status,
             li_salt=li_salt,
             correction=correction,
@@ -1258,7 +1462,7 @@ class WorkflowTab(ttk.Frame):
     def _tree_values(self, item: _WorkflowItem) -> tuple[str, str, str, str, str, str, str]:
         return (
             item.date_name,
-            item.analysis_id,
+            item.work_label or item.analysis_id,
             item.qc_status,
             item.ml_status,
             item.li_salt,
@@ -1267,11 +1471,15 @@ class WorkflowTab(ttk.Frame):
         )
 
     def _tree_tag(self, item: _WorkflowItem) -> str:
-        if item.qc_status != "DONE":
+        if item.qc_status in {"Fail", "Needed", "Hold"}:
             return "red"
-        if item.ml_status != "DONE":
+        if item.qc_status == "Warning" or item.ml_status != "DONE":
             return "yellow"
         return "blue"
+
+    @staticmethod
+    def _qc_allows_ml(qc_status: str) -> bool:
+        return qc_status in {"Pass", "Warning"}
 
     def _sort_by_column(self, column: str) -> None:
         if self._sort_column == column:
@@ -1284,7 +1492,7 @@ class WorkflowTab(ttk.Frame):
     def _sync_tree_headings(self) -> None:
         headings = {
             "date": "Date",
-            "analysis_id": "Analysis ID",
+            "analysis_id": "Work Folder",
             "qc": "QC",
             "ml": "ML / DB",
             "li_salt": "Li-salt %",
@@ -1314,7 +1522,7 @@ class WorkflowTab(ttk.Frame):
             parsed = self._parse_date_folder(item.date_name)
             return parsed or datetime.min
         if column == "analysis_id":
-            return item.analysis_id
+            return item.work_label or item.analysis_id
         if column == "qc":
             return item.qc_status
         if column == "ml":
@@ -1343,82 +1551,55 @@ class WorkflowTab(ttk.Frame):
             return "Review"
         return "Mixed" if corrected_rows else "NO"
 
-    def _qc_output_status(self, analysis_path: Path, analysis_id: str) -> tuple[bool, str]:
-        if is_test_analysis_id(analysis_id):
-            missing = [
-                source_path.name
-                for _, source_path in find_test_source_folders(analysis_path)
-                if not self._has_pass_png(
-                    get_test_output_folders(analysis_path, source_path)[0]
-                )
-            ]
-            return (
-                not missing,
-                f"TEST PASS missing: {', '.join(missing)}" if missing else "QC ready",
-            )
+    def _qc_output_status(self, date_name: str, date_path: Path, work_path: Path) -> tuple[str, str]:
+        if self._parse_date_folder(date_name) is None:
+            return "Fail", f"Invalid date folder: {date_name}"
+        if not work_path.is_dir():
+            return "Fail", f"Work folder not found: {work_path}"
 
-        source_folders = self._forced_source_folders(analysis_path)
-        if not source_folders:
-            return False, "No FRONT/BACK source folders found"
+        source_images = self._source_images(work_path)
+        if not source_images:
+            return "Fail", "No image work folder found"
 
-        expected_pass_count = self._expected_pass_count(analysis_id)
-        mismatches: list[tuple[str, str, int, int | None]] = []
-        for cell_name, face_name, source_path in source_folders:
-            pass_path = source_path.parent / f"{face_name}_pass"
-            pass_count = len(self._pass_pngs(pass_path))
-            if expected_pass_count is None:
-                if pass_count <= 0:
-                    mismatches.append((cell_name, pass_path.name, pass_count, None))
-            elif pass_count != expected_pass_count:
-                mismatches.append((cell_name, pass_path.name, pass_count, expected_pass_count))
-
-        if not mismatches:
-            return True, "QC ready"
-        if all(pass_count <= 0 for _cell, _folder, pass_count, _expected in mismatches):
-            return False, "QC not run"
-        reasons = []
-        for cell_name, folder_name, pass_count, expected in mismatches:
-            if expected is None or pass_count <= 0:
-                reasons.append(f"{cell_name} {folder_name} not generated")
-            else:
-                reasons.append(f"{cell_name} {folder_name} count {pass_count}/{expected}")
-        return False, "; ".join(reasons)
+        warning = self._image_count_warning(len(source_images))
+        pass_count = len(self._work_pass_pngs(work_path))
+        if pass_count <= 0:
+            summary = "QC not run"
+            if warning:
+                summary = f"{summary}; {warning}"
+            return "Needed", summary
+        if pass_count < len(source_images):
+            summary = f"_PASS count {pass_count}/{len(source_images)}"
+            if warning:
+                summary = f"{summary}; {warning}"
+            return "Needed", summary
+        if warning:
+            return "Warning", warning
+        return "Pass", "QC ready"
 
     def _qc_complete(self, date_name: str, date_path: Path, analysis_id: str) -> tuple[bool, str]:
-        folder_result = self._qc_pipeline.validate_folder(
-            root_path=self._root_path,
-            date_name=date_name,
-            analysis_id=analysis_id,
+        item = next(
+            (
+                candidate
+                for candidate in self._items
+                if candidate.date_name == date_name and candidate.analysis_id == analysis_id
+            ),
+            None,
         )
-        if folder_result.status != "PASS":
-            return False, "; ".join(folder_result.fail_reasons) or "FolderQC FAIL"
-        if is_test_analysis_id(analysis_id):
-            analysis_path = date_path / analysis_id
-            missing = [
-                source_path.name
-                for _, source_path in find_test_source_folders(analysis_path)
-                if not self._has_pass_png(
-                    get_test_output_folders(analysis_path, source_path)[0]
-                )
-            ]
-            return (
-                not missing,
-                f"TEST PASS missing: {', '.join(missing)}" if missing else "QC ready",
-            )
-        pass_ok, pass_reasons = self._pass_outputs_complete(folder_result, analysis_id)
-        if not pass_ok:
-            return False, "; ".join(pass_reasons)
-        return True, "QC ready"
+        work_path = item.analysis_path if item is not None else date_path / analysis_id
+        qc_status, summary = self._qc_output_status(date_name, date_path, work_path)
+        return self._qc_allows_ml(qc_status), summary
 
     def _pass_outputs_complete(self, folder_result, analysis_id: str) -> tuple[bool, list[str]]:
         mismatches: list[tuple[str, str, int, int | None]] = []
-        expected_pass_count = self._expected_pass_count(analysis_id)
+        expected_pass_count = (
+            None if folder_result.status == "WARNING" else self._expected_pass_count(analysis_id)
+        )
         for cell in folder_result.cells:
             for face, source_path in (("FRONT", cell.front_path), ("BACK", cell.back_path)):
                 if source_path is None:
-                    mismatches.append((cell.cell_name, face, 0, expected_pass_count))
                     continue
-                pass_path = source_path.parent / f"{face}_pass"
+                pass_path = self._pass_output_folder(face, source_path)
                 pass_count = len(self._pass_pngs(pass_path))
                 if expected_pass_count is None:
                     if pass_count <= 0:
@@ -1440,12 +1621,25 @@ class WorkflowTab(ttk.Frame):
         return False, reasons
 
     def _expected_pass_count(self, analysis_id: str) -> int | None:
-        if is_test_analysis_id(analysis_id) or len(analysis_id) < 2:
-            return None
-        expected_source = self._image_count_rules.get(analysis_id[1])
+        expected_source = self._expected_source_count()
         if expected_source is None:
             return None
         return max(int(expected_source) - 2, 0)
+
+    def _expected_source_count(self) -> int | None:
+        customer_code = self._selected_customer_code()
+        if customer_code == "ETC":
+            return None
+        expected_source = self._image_count_rules.get(customer_code)
+        if expected_source is None:
+            return None
+        return int(expected_source)
+
+    def _image_count_warning(self, actual_count: int) -> str:
+        expected_count = self._expected_source_count()
+        if expected_count is None or actual_count == expected_count:
+            return ""
+        return f"Warning: Expected {expected_count} electrodes, found {actual_count}"
 
     def _has_pass_png(self, folder_path: Path) -> bool:
         if not folder_path.is_dir():
@@ -1481,7 +1675,7 @@ class WorkflowTab(ttk.Frame):
             analysis_id=analysis_id,
         )
         cells: list[int] = []
-        if folder_result.status != "PASS":
+        if folder_result.status == "FAIL":
             return sorted(
                 {
                     self._cell_number_from_name(cell_name)
@@ -1520,12 +1714,88 @@ class WorkflowTab(ttk.Frame):
                 folder_path = face_paths.get(face_name)
                 if folder_path is not None:
                     sources.append((cell_name, face_name, folder_path))
+            if not face_paths and any(
+                child.path.is_file() and child.path.suffix.lower() in _IMAGE_EXTENSIONS
+                for child in self._list_folder_children(cell_path)
+            ):
+                sources.append((cell_name, "FRONT", cell_path))
         return sources
 
+    @staticmethod
+    def _pass_output_folder(face_name: str, source_path: Path) -> Path:
+        if face_name.upper() == "WORK":
+            return source_path / "_PASS"
+        if source_path.name.upper() == face_name.upper():
+            return source_path.parent / f"{face_name}_pass"
+        return source_path / f"{face_name}_pass"
+
+    def _work_pass_folder_candidates(self, work_path: Path) -> list[Path]:
+        return self._unique_paths(
+            [
+                work_path / "_PASS",
+                work_path / "_pass",
+                work_path.parent / f"{work_path.name}_PASS",
+                work_path.parent / f"{work_path.name}_pass",
+            ]
+        )
+
+    def _work_mask_folder_candidates(self, work_path: Path) -> list[Path]:
+        return self._unique_paths(
+            [
+                work_path / "_MASK",
+                work_path / "_mask",
+                work_path.parent / f"{work_path.name}_MASK",
+                work_path.parent / f"{work_path.name}_mask",
+            ]
+        )
+
+    @staticmethod
+    def _unique_paths(paths: list[Path]) -> list[Path]:
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for path in paths:
+            key = os.path.normcase(str(path.resolve(strict=False)))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
+
+    def _work_pass_pngs(self, work_path: Path) -> list[Path]:
+        return self._unique_paths(
+            [
+                path
+                for folder in self._work_pass_folder_candidates(work_path)
+                for path in self._pass_pngs(folder)
+            ]
+        )
+
+    def _work_mask_pngs(self, work_path: Path) -> list[Path]:
+        return self._unique_paths(
+            [
+                path
+                for folder in self._work_mask_folder_candidates(work_path)
+                for path in self._mask_pngs(folder)
+            ]
+        )
+
+    def _preferred_work_pass_folder(self, work_path: Path) -> Path:
+        primary = self._pass_output_folder("WORK", work_path)
+        if self._pass_pngs(primary):
+            return primary
+        for candidate in self._work_pass_folder_candidates(work_path):
+            if self._pass_pngs(candidate):
+                return candidate
+        return primary
+
     def _find_result_csv(self, analysis_path: Path, analysis_id: str) -> Path | None:
-        old_path = analysis_path / _RESULT_PATTERN_OLD.format(analysis_id=analysis_id)
-        candidates = [old_path] if old_path.exists() else []
-        candidates.extend(analysis_path.glob(_RESULT_PATTERN_NEW.format(analysis_id=analysis_id)))
+        search_dirs = self._unique_paths([analysis_path, *self._work_mask_folder_candidates(analysis_path)])
+        candidates = []
+        for search_dir in search_dirs:
+            old_path = search_dir / _RESULT_PATTERN_OLD.format(analysis_id=analysis_id)
+            if old_path.exists():
+                candidates.append(old_path)
+            candidates.extend(search_dir.glob(_RESULT_PATTERN_NEW.format(analysis_id=analysis_id)))
         if not candidates:
             return None
         return max(candidates, key=lambda path: path.stat().st_mtime)
@@ -1545,10 +1815,28 @@ class WorkflowTab(ttk.Frame):
                 return "-"
             if value <= 1.0:
                 value *= 100.0
-            return f"{value:.2f}%"
+            return f"{self._format_li_salt_percent(value)}%"
         except Exception:
             logger.exception("Failed to summarize result CSV: %s", csv_path)
             return "-"
+
+    @staticmethod
+    def _li_salt_percent_from_summary(summary: str) -> float | None:
+        match = re.search(r"[-+]?[0-9]*\.?[0-9]+", summary)
+        if not match:
+            return None
+        try:
+            return float(match.group(0))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _format_li_salt_percent(value: float) -> str:
+        if value == 0:
+            return "0.00"
+        if abs(value) < 0.01:
+            return f"{value:.4f}"
+        return f"{value:.2f}"
 
     def _selected_items(self) -> list[_WorkflowItem]:
         selected = [self._item_by_tree_id[item_id] for item_id in self._tree.selection() if item_id in self._item_by_tree_id]
@@ -1562,12 +1850,17 @@ class WorkflowTab(ttk.Frame):
         ]
 
     def _on_run_qc_toggle(self) -> None:
-        if self._run_ml_var.get() and not self._run_qc_var.get():
-            self._run_qc_var.set(True)
+        if self._run_qc_var.get():
+            self._only_crop_var.set(False)
+        self._sync_run_mode_controls(not self._running)
+
+    def _on_only_crop_toggle(self) -> None:
+        if self._only_crop_var.get():
+            self._run_qc_var.set(False)
+        self._sync_run_mode_controls(not self._running)
 
     def _on_run_ml_toggle(self) -> None:
-        if self._run_ml_var.get():
-            self._run_qc_var.set(True)
+        self._sync_run_mode_controls(not self._running)
 
     def _run_workflow(self) -> None:
         if self._is_folder_mode():
@@ -1577,16 +1870,27 @@ class WorkflowTab(ttk.Frame):
             self._run_folder_selection()
             return
         run_ml = bool(self._run_ml_var.get())
-        run_qc = bool(self._run_qc_var.get()) or run_ml
-        if run_ml and not self._run_qc_var.get():
-            self._run_qc_var.set(True)
-        self._start_run(self._selected_items(), force_qc=False, run_qc=run_qc, run_ml=run_ml)
+        run_qc = bool(self._run_qc_var.get())
+        only_crop = bool(self._only_crop_var.get())
+        if not run_qc and not only_crop and not run_ml:
+            messagebox.showinfo("Workflow", "Select QC, Only Crop, or ML before running.")
+            return
+        self._start_run(
+            self._selected_items(),
+            force_qc=False,
+            run_qc=run_qc,
+            only_crop=only_crop,
+            run_ml=run_ml,
+        )
 
     def _run_folder_selection(self) -> None:
         run_ml = bool(self._run_ml_var.get())
-        run_crop = bool(self._run_qc_var.get()) or run_ml
+        run_crop = bool(self._run_qc_var.get()) or bool(self._only_crop_var.get())
         if not run_crop:
-            messagebox.showinfo("By Folder", "Select QC for crop, or ML for crop + ML.")
+            if run_ml:
+                messagebox.showinfo("By Folder", "Select QC or Only Crop before running ML in By Folder mode.")
+            else:
+                messagebox.showinfo("By Folder", "Select QC, Only Crop, or ML before running.")
             return
         selected_paths = self._selected_root_paths()
         if not selected_paths:
@@ -1623,14 +1927,15 @@ class WorkflowTab(ttk.Frame):
         force_qc: bool,
         *,
         run_qc: bool,
+        only_crop: bool,
         run_ml: bool,
     ) -> None:
         if self._running:
             return
-        if not run_qc and not run_ml:
+        if not run_qc and not only_crop and not run_ml:
             return
         if not items:
-            messagebox.showinfo("Workflow", "No AnalysisIDs to process.")
+            messagebox.showinfo("Workflow", "No work folders to process.")
             return
 
         duplicate_pairs = self._existing_pairs_for_items(items) if run_ml else set()
@@ -1641,7 +1946,7 @@ class WorkflowTab(ttk.Frame):
                 preview += ", ..."
             replace = messagebox.askyesno(
                 "SQLite Monitoring Duplicate",
-                "Monitoring DB already has rows for these AnalysisID + Cell pairs:\n\n"
+                "Monitoring DB already has rows for these work folder + cell pairs:\n\n"
                 f"{preview}\n\nReplace existing SQLite rows?",
             )
             if replace:
@@ -1656,7 +1961,7 @@ class WorkflowTab(ttk.Frame):
         self._progress.configure(maximum=max(len(items), 1), value=0)
         self._worker = threading.Thread(
             target=self._workflow_worker,
-            args=(items, skip_pairs, self._preview_enabled, force_qc, run_qc, run_ml),
+            args=(items, skip_pairs, self._preview_enabled, force_qc, run_qc, only_crop, run_ml),
             daemon=True,
         )
         self._worker.start()
@@ -2226,9 +2531,12 @@ class WorkflowTab(ttk.Frame):
     ) -> None:
         success_count = 0
         fail_count = 0
+        qc_failures: list[dict[str, object]] = []
+        folder_rows: dict[Path, list[dict]] = {}
         try:
             if run_ml:
                 self._load_quick_ml_config()
+                self._clear_quick_generated_csvs(files)
             for index, image_path in enumerate(files, start=1):
                 if self._stop_event.is_set():
                     break
@@ -2241,6 +2549,8 @@ class WorkflowTab(ttk.Frame):
                 )
                 try:
                     result = self._run_quick_file(image_path, image_num=index, run_ml=run_ml)
+                    if run_ml and "result_row" in result:
+                        folder_rows.setdefault(image_path.parent, []).append(dict(result["result_row"]))
                     success_count += 1
                     self._queue.put(
                         (
@@ -2273,6 +2583,20 @@ class WorkflowTab(ttk.Frame):
                                     "Crop",
                                 )
                             )
+                except _QuickQCHoldError as exc:
+                    fail_count += 1
+                    qc_failures.append(exc.failed_item)
+                    logger.debug("Quick/Folder QC hold: %s", image_path, exc_info=True)
+                    self._queue.put(
+                        (
+                            "quick_status",
+                            {
+                                "path": image_path,
+                                "status": "FAIL - QC hold",
+                                "output": str(exc),
+                            },
+                        )
+                    )
                 except Exception as exc:
                     fail_count += 1
                     logger.debug("Quick Crop + ML failed: %s", image_path, exc_info=True)
@@ -2287,6 +2611,22 @@ class WorkflowTab(ttk.Frame):
                         )
                     )
                 self._queue.put(("quick_progress", index))
+            if run_ml and folder_rows:
+                self._write_quick_folder_csvs(folder_rows)
+            if qc_failures:
+                self._queue.put(
+                    (
+                        "quick_qc_hold",
+                        {
+                            "key": f"quick|{datetime.now().isoformat(timespec='microseconds')}",
+                            "analysis_id": label_prefix,
+                            "analysis_path": files[0].parent if files else self._root_path,
+                            "batch_hold": True,
+                            "failures": qc_failures,
+                        },
+                    )
+                )
+                return
             self._queue.put(
                 (
                     "quick_done",
@@ -2302,7 +2642,7 @@ class WorkflowTab(ttk.Frame):
             logger.debug("Quick worker error", exc_info=True)
             self._queue.put(("error", str(exc)))
 
-    def _run_quick_file(self, image_path: Path, *, image_num: int, run_ml: bool = True) -> dict[str, Path]:
+    def _run_quick_file(self, image_path: Path, *, image_num: int, run_ml: bool = True) -> dict[str, object]:
         work_dir = path_resolver.make_unique_work_dir(
             self._config_path.parent.parent / "_quick_temp",
             prefix="image_",
@@ -2315,6 +2655,8 @@ class WorkflowTab(ttk.Frame):
                 run_ml=run_ml,
                 work_dir=work_dir,
             )
+        except _QuickQCHoldError:
+            raise
         except Exception:
             keep_work_dir = True
             raise
@@ -2332,7 +2674,7 @@ class WorkflowTab(ttk.Frame):
         image_num: int,
         run_ml: bool,
         work_dir: Path,
-    ) -> dict[str, Path]:
+    ) -> dict[str, object]:
         local_source = path_resolver.make_unique_stage_path(work_dir, image_path.name)
         copy_result = path_resolver.safe_copy_file(image_path, local_source)
         if not copy_result.success:
@@ -2356,7 +2698,18 @@ class WorkflowTab(ttk.Frame):
         )
         if crop_result.status != "PASS" or crop_result.output_path is None:
             reason = " | ".join(crop_result.fail_reasons) or "Crop failed"
-            raise RuntimeError(reason)
+            raise _QuickQCHoldError(
+                reason,
+                {
+                    "id": str(image_path),
+                    "image_path": image_path,
+                    "output_path": self._quick_destination_for_output(image_path, crop_path),
+                    "fail_reasons": list(crop_result.fail_reasons),
+                    "customer_code": customer_code,
+                    "skip_size_validation": skip_size_validation,
+                    "image_postprocess": None,
+                },
+            )
 
         if not run_ml:
             saved_paths = self._copy_quick_outputs_to_source(
@@ -2386,25 +2739,21 @@ class WorkflowTab(ttk.Frame):
             inference_result.monitoring_record.get("correction_applied") or 0
         )
         li_salt_percent = self._li_salt_percent_from_result_row(result_row)
-        csv_path = output_dir / self._quick_csv_filename(local_source, li_salt_percent)
-        self._write_quick_csv(
-            csv_path,
-            result_row,
-            source_path=image_path,
-            crop_path=crop_result.output_path,
-            mask_path=inference_result.mask_path or mask_path,
-        )
-        saved_crop, saved_mask, saved_csv = self._copy_quick_outputs_to_source(
+        saved_crop, saved_mask = self._copy_quick_outputs_to_source(
             image_path,
-            [crop_result.output_path, inference_result.mask_path or mask_path, csv_path],
+            [crop_result.output_path, inference_result.mask_path or mask_path],
             fallback_dir=output_dir,
-            li_salt_percent=li_salt_percent,
         )
         return {
-            "output_dir": saved_csv.parent,
+            "output_dir": saved_mask.parent,
             "crop_path": saved_crop,
             "mask_path": saved_mask,
-            "csv_path": saved_csv,
+            "result_row": self._quick_csv_row(
+                result_row,
+                source_path=image_path,
+                crop_path=saved_crop,
+                mask_path=saved_mask,
+            ),
         }
 
     def _copy_quick_outputs_to_source(
@@ -2453,7 +2802,9 @@ class WorkflowTab(ttk.Frame):
         return pass_dir / f"{source_image_path.stem}.png"
 
     def _quick_result_dirs_for_source(self, source_image_path: Path) -> tuple[Path, Path]:
-        source_folder = source_image_path.parent
+        return self._quick_result_dirs_for_folder(source_image_path.parent)
+
+    def _quick_result_dirs_for_folder(self, source_folder: Path) -> tuple[Path, Path]:
         folder_name = source_folder.name
         return (
             source_folder.parent / f"{folder_name}_PASS",
@@ -2461,6 +2812,9 @@ class WorkflowTab(ttk.Frame):
         )
 
     def _quick_result_csv_for_source(self, source_image_path: Path) -> Path | None:
+        folder_csv = self._quick_folder_result_csv(source_image_path.parent)
+        if folder_csv is not None:
+            return folder_csv
         _pass_dir, mask_dir = self._quick_result_dirs_for_source(source_image_path)
         candidates = sorted(
             mask_dir.glob(f"{source_image_path.stem}_LI_SALT_*.csv"),
@@ -2491,7 +2845,24 @@ class WorkflowTab(ttk.Frame):
     def _quick_csv_filename(self, image_path: Path, li_salt_percent: float | None) -> str:
         if li_salt_percent is None:
             return f"{image_path.stem}_LI_SALT.csv"
-        return f"{image_path.stem}_LI_SALT_{li_salt_percent:.2f}%.csv"
+        return f"{image_path.stem}_LI_SALT_{self._format_li_salt_percent(li_salt_percent)}%.csv"
+
+    def _quick_folder_csv_filename(self, source_folder: Path, li_salt_percent: float | None) -> str:
+        folder_name = re.sub(r"[^A-Za-z0-9_]+", "_", source_folder.name).strip("_") or "WORK"
+        if li_salt_percent is None:
+            return f"{folder_name}_LI-SALT.csv"
+        return f"{folder_name}_LI-SALT_{self._format_li_salt_percent(li_salt_percent)}%.csv"
+
+    def _quick_folder_result_csv(self, source_folder: Path) -> Path | None:
+        _pass_dir, mask_dir = self._quick_result_dirs_for_folder(source_folder)
+        folder_name = re.sub(r"[^A-Za-z0-9_]+", "_", source_folder.name).strip("_") or "WORK"
+        candidates = []
+        if mask_dir.is_dir():
+            candidates.extend(mask_dir.glob(f"{folder_name}_LI-SALT_*.csv"))
+            candidates.extend(mask_dir.glob(f"{folder_name}_LI-SALT.csv"))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
 
     def _li_salt_percent_from_result_row(self, result_row: dict) -> float | None:
         try:
@@ -2513,6 +2884,63 @@ class WorkflowTab(ttk.Frame):
         stem = re.sub(r"[^A-Za-z0-9_]+", "_", image_path.stem).strip("_")
         return f"QUICK_{stem or 'IMAGE'}"
 
+    def _quick_csv_row(
+        self,
+        result_row: dict,
+        *,
+        source_path: Path,
+        crop_path: Path,
+        mask_path: Path,
+    ) -> dict:
+        row = {
+            "source_image": str(source_path),
+            "crop_image": str(crop_path),
+            "mask_image": str(mask_path),
+        }
+        row.update(result_row)
+        return row
+
+    def _write_quick_folder_csvs(self, folder_rows: dict[Path, list[dict]]) -> list[Path]:
+        csv_paths: list[Path] = []
+        for source_folder, rows in folder_rows.items():
+            if not rows:
+                continue
+            _pass_dir, mask_dir = self._quick_result_dirs_for_folder(source_folder)
+            mask_dir.mkdir(parents=True, exist_ok=True)
+            average_percent = self._average_li_salt_percent_from_rows(rows)
+            csv_path = mask_dir / self._quick_folder_csv_filename(source_folder, average_percent)
+            pd.DataFrame(
+                rows,
+                columns=[
+                    "source_image",
+                    "crop_image",
+                    "mask_image",
+                    "AnalysisID",
+                    "Cell",
+                    "Face",
+                    "ImageNum",
+                    "total_pixel",
+                    "background_ratio",
+                    "nonactive_ratio",
+                    "li_salt_ratio",
+                    "correction_applied",
+                ],
+            ).to_csv(csv_path, index=False, float_format="%.6f")
+            csv_paths.append(csv_path)
+        return csv_paths
+
+    def _clear_quick_generated_csvs(self, source_images: list[Path]) -> None:
+        mask_dirs = {self._quick_result_dirs_for_source(path)[1] for path in source_images}
+        for mask_dir in mask_dirs:
+            if not mask_dir.is_dir():
+                continue
+            for path in mask_dir.iterdir():
+                if path.is_file() and self._is_generated_li_salt_csv(path):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        logger.warning("Failed to remove stale Li-salt CSV: %s", path, exc_info=True)
+
     def _write_quick_csv(
         self,
         csv_path: Path,
@@ -2522,12 +2950,12 @@ class WorkflowTab(ttk.Frame):
         crop_path: Path,
         mask_path: Path,
     ) -> None:
-        row = {
-            "source_image": str(source_path),
-            "crop_image": str(crop_path),
-            "mask_image": str(mask_path),
-        }
-        row.update(result_row)
+        row = self._quick_csv_row(
+            result_row,
+            source_path=source_path,
+            crop_path=crop_path,
+            mask_path=mask_path,
+        )
         pd.DataFrame(
             [row],
             columns=[
@@ -2544,7 +2972,7 @@ class WorkflowTab(ttk.Frame):
                 "li_salt_ratio",
                 "correction_applied",
             ],
-        ).to_csv(csv_path, index=False, float_format="%.2f")
+        ).to_csv(csv_path, index=False, float_format="%.6f")
 
     def _update_quick_tree_status(self, payload: dict) -> None:
         path = Path(payload.get("path", ""))
@@ -2565,14 +2993,23 @@ class WorkflowTab(ttk.Frame):
             values = [str(path), "", ""]
         values[1] = str(payload.get("status", ""))
         values[2] = str(payload.get("output", ""))
-        self._quick_tree.item(tree_id, values=values)
+        status = values[1].upper()
+        if "FAIL" in status or "HOLD" in status:
+            tags = ("quick_fail",)
+        elif "RUN" in status:
+            tags = ("quick_running",)
+        elif "PASS" in status:
+            tags = ("quick_pass",)
+        else:
+            tags = ()
+        self._quick_tree.item(tree_id, values=values, tags=tags)
         self._quick_tree.see(tree_id)
 
     def _request_stop(self) -> None:
         if not self._running:
             return
         self._stop_event.set()
-        self._status_label.config(text="Stopping after current AnalysisID...")
+        self._status_label.config(text="Stopping after current work folder...")
 
     def _workflow_worker(
         self,
@@ -2581,27 +3018,67 @@ class WorkflowTab(ttk.Frame):
         preview_enabled: bool,
         force_qc: bool,
         run_qc: bool,
+        only_crop: bool,
         run_ml: bool,
     ) -> None:
         try:
             if run_ml:
                 self._load_ml_config()
             processed = 0
+            if run_qc:
+                held_failures: list[dict[str, object]] = []
+                for item in items:
+                    if self._stop_event.is_set():
+                        break
+                    self._cleanup_runtime_artifacts(item.analysis_path)
+                    self._queue.put(("current", f"{item.analysis_id}: QC"))
+                    self._reset_qc_hold_for_rerun(item)
+                    failures = self._run_work_folder_crop(
+                        item,
+                        skip_size_validation=False,
+                        force_save_failed=False,
+                    )
+                    if failures:
+                        self._store_qc_hold(item, failures)
+                        held_failures.extend(failures)
+                    else:
+                        self._clear_qc_hold(item)
+                    processed += 1
+                    self._queue.put(("progress", (processed, item.date_name, item.date_path, item.analysis_id, item.analysis_path)))
+                if held_failures:
+                    self._queue.put(
+                        (
+                            "batch_qc_hold",
+                            {
+                                "key": f"batch|{datetime.now().isoformat(timespec='microseconds')}",
+                                "analysis_id": "QC Failures",
+                                "analysis_path": items[0].analysis_path if items else self._root_path,
+                                "failures": held_failures,
+                            },
+                        )
+                    )
+                    return
+                if not run_ml:
+                    self._queue.put(("done", None))
+                    return
+                processed = 0
             for item in items:
                 if self._stop_event.is_set():
                     break
                 self._cleanup_runtime_artifacts(item.analysis_path)
                 refreshed = item
-                should_run_qc = run_qc and (
-                    not run_ml or force_qc or item.qc_status != "DONE"
-                )
+                should_run_qc = run_qc
                 if should_run_qc:
-                    self._queue.put(("current", f"{item.analysis_id}: QC"))
+                    refreshed = self._build_item(item.date_name, item.date_path, item.analysis_id, item.analysis_path)
+                elif only_crop:
+                    self._queue.put(("current", f"{item.analysis_id}: crop"))
                     self._reset_qc_hold_for_rerun(item)
-                    self._run_qc_for_item(item, force_folder_qc=force_qc)
-                    refreshed = self._build_item(item.date_name, item.date_path, item.analysis_id)
-                    self._queue.put(("refresh", (item.date_name, item.date_path, item.analysis_id)))
-                if run_ml and (force_qc or refreshed.qc_status == "DONE"):
+                    qc_held = self._run_only_crop_for_item(item)
+                    if qc_held:
+                        return
+                    refreshed = self._build_item(item.date_name, item.date_path, item.analysis_id, item.analysis_path)
+                    self._queue.put(("refresh", (item.date_name, item.date_path, item.analysis_id, item.analysis_path)))
+                if run_ml and (force_qc or self._qc_allows_ml(refreshed.qc_status)):
                     self._queue.put(("current", f"{item.analysis_id}: ML"))
                     self._run_ml_for_item(refreshed, skip_pairs, preview_enabled, force_qc=force_qc)
                 elif run_ml:
@@ -2611,29 +3088,78 @@ class WorkflowTab(ttk.Frame):
                         refreshed.summary,
                     )
                 processed += 1
-                self._queue.put(("progress", (processed, item.date_name, item.date_path, item.analysis_id)))
+                self._queue.put(("progress", (processed, item.date_name, item.date_path, item.analysis_id, item.analysis_path)))
             self._queue.put(("done", None))
         except Exception as exc:
             logger.exception("Workflow worker error")
             self._queue.put(("error", str(exc)))
 
-    def _run_qc_for_item(self, item: _WorkflowItem, force_folder_qc: bool = False) -> None:
-        result = self._qc_pipeline.run_analysis(
-            root_path=self._root_path,
-            date_name=item.date_name,
-            analysis_id=item.analysis_id,
-            analysis_path=item.analysis_path,
-            force_folder_qc=force_folder_qc,
-            clear_pass_outputs=True,
+    def _run_qc_for_item(self, item: _WorkflowItem, force_folder_qc: bool = False) -> bool:
+        return self._handle_qc_failures(
+            item,
+            self._run_work_folder_crop(
+                item,
+                skip_size_validation=False,
+                force_save_failed=False,
+            ),
         )
-        self._handle_qc_failures(item, result.failed_items)
 
-    def _handle_qc_failures(self, item: _WorkflowItem, failed_items: list[dict[str, object]]) -> None:
+    def _run_only_crop_for_item(self, item: _WorkflowItem) -> bool:
+        return self._handle_qc_failures(
+            item,
+            self._run_work_folder_crop(
+                item,
+                skip_size_validation=True,
+                force_save_failed=True,
+            ),
+        )
+
+    def _run_work_folder_crop(
+        self,
+        item: _WorkflowItem,
+        *,
+        skip_size_validation: bool,
+        force_save_failed: bool,
+    ) -> list[dict[str, object]]:
+        output_folder = self._pass_output_folder("WORK", item.analysis_path)
+        self._qc_pipeline.clear_pass_outputs(output_folder)
+        customer_code = self._selected_customer_code()
+        failed_items: list[dict[str, object]] = []
+        for image_path in self._source_images(item.analysis_path):
+            output_path = output_folder / f"{image_path.stem}.png"
+            result = self._quick_crop_engine.process_image(
+                image_path=image_path,
+                customer_code=customer_code,
+                output_path=output_path,
+                skip_size_validation=skip_size_validation,
+                image_postprocess=None,
+                force_save_failed=force_save_failed,
+            )
+            if result.status == "FAIL":
+                failed_items.append(
+                    {
+                        "id": str(image_path),
+                        "image_path": image_path,
+                        "output_path": output_path,
+                        "fail_reasons": list(result.fail_reasons),
+                        "customer_code": customer_code,
+                        "skip_size_validation": skip_size_validation,
+                        "image_postprocess": None,
+                    }
+                )
+        return failed_items
+
+    def _handle_qc_failures(self, item: _WorkflowItem, failed_items: list[dict[str, object]]) -> bool:
         if not failed_items:
             self._clear_qc_hold(item)
-            return
+            return False
         if self._stop_event.is_set():
-            return
+            return True
+        held = self._store_qc_hold(item, failed_items)
+        self._queue.put(("qc_hold", held))
+        return True
+
+    def _store_qc_hold(self, item: _WorkflowItem, failed_items: list[dict[str, object]]) -> dict[str, object]:
         held = {
             "key": item.key,
             "date_name": item.date_name,
@@ -2644,20 +3170,16 @@ class WorkflowTab(ttk.Frame):
         }
         self._held_qc_failures[item.key] = held
         self._persist_qc_hold_state(held)
-        self._queue.put(
-            (
-                "qc_hold",
-                held,
-            )
-        )
+        return held
 
     def _load_qc_hold_state(
         self,
         date_name: str,
         date_path: Path,
         analysis_id: str,
+        analysis_path: Path | None = None,
     ) -> dict[str, object] | None:
-        analysis_path = date_path / analysis_id
+        analysis_path = analysis_path or date_path / analysis_id
         hold_path = self._hold_state_path(analysis_path)
         if not hold_path.exists():
             return None
@@ -2667,7 +3189,7 @@ class WorkflowTab(ttk.Frame):
             logger.warning("Failed to load QC hold state: %s", hold_path, exc_info=True)
             return None
 
-        key = f"{date_name}|{analysis_id}"
+        key = self._work_item_key(date_name, analysis_path)
         failures: list[dict[str, object]] = []
         for failure in raw.get("failures", []):
             image_path = Path(failure.get("image_path", ""))
@@ -2682,7 +3204,7 @@ class WorkflowTab(ttk.Frame):
                     "fail_reasons": list(failure.get("fail_reasons", [])),
                     "customer_code": str(
                         failure.get("customer_code")
-                        or self._customer_code_for_analysis(analysis_id)
+                        or self._selected_customer_code()
                     ),
                     "skip_size_validation": bool(failure.get("skip_size_validation", False)),
                     "image_postprocess": self._current_image_postprocess(),
@@ -2716,20 +3238,20 @@ class WorkflowTab(ttk.Frame):
             date_name=date_name,
             analysis_id=analysis_id,
         )
-        if folder_result.status != "PASS":
+        if folder_result.status == "FAIL":
             return None
         expected_pass_count = self._expected_pass_count(analysis_id)
         if expected_pass_count is None:
             return None
 
         failures: list[dict[str, object]] = []
-        customer_code = self._customer_code_for_analysis(analysis_id)
+        customer_code = self._selected_customer_code()
         image_postprocess = self._current_image_postprocess()
         for cell in folder_result.cells:
             for face_name, source_path in (("FRONT", cell.front_path), ("BACK", cell.back_path)):
                 if source_path is None:
                     continue
-                output_folder = source_path.parent / f"{face_name}_pass"
+                output_folder = self._pass_output_folder(face_name, source_path)
                 pass_count = len(self._pass_pngs(output_folder))
                 if pass_count <= 0 or pass_count >= expected_pass_count:
                     continue
@@ -2881,11 +3403,10 @@ class WorkflowTab(ttk.Frame):
         qc_ok, qc_summary = self._qc_complete(item.date_name, item.date_path, item.analysis_id)
         if not qc_ok and not force_qc:
             logger.warning("ML skipped because QC pass outputs are incomplete: %s / %s", item.analysis_id, qc_summary)
-            self._queue.put(("refresh", (item.date_name, item.date_path, item.analysis_id)))
+            self._queue.put(("refresh", (item.date_name, item.date_path, item.analysis_id, item.analysis_path)))
             return
         tasks = self._build_ml_tasks(item, force_qc=force_qc)
-        if self._save_mask_images:
-            self._clear_mask_outputs_for_tasks(tasks)
+        self._clear_mask_outputs_for_tasks(tasks, clear_masks=self._save_mask_images)
         pipeline = self._inference_pipeline
         if pipeline is None:
             raise RuntimeError("Inference pipeline is not loaded.")
@@ -2903,6 +3424,7 @@ class WorkflowTab(ttk.Frame):
                 face=task.face,
                 image_num=task.image_num,
                 image_path=task.image_path,
+                customer=task.customer,
             )
             mask_path = self._mask_dir_for_task(task) / f"{task.image_path.stem}_mask.png"
             result = pipeline.run_image(pipeline_task, mask_path=mask_path)
@@ -2933,51 +3455,13 @@ class WorkflowTab(ttk.Frame):
             self._sqlite_logger.insert_prediction_run(record)
 
     def _build_ml_tasks(self, item: _WorkflowItem, force_qc: bool = False) -> list[_ImageTask]:
-        if is_test_analysis_id(item.analysis_id):
-            tasks: list[_ImageTask] = []
-            for cell, source_folder in find_test_source_folders(item.analysis_path):
-                pass_path, _ = get_test_output_folders(item.analysis_path, source_folder)
-                tasks.extend(
-                    _ImageTask(
-                        item.analysis_id,
-                        item.analysis_path,
-                        cell,
-                        "TEST",
-                        index,
-                        path,
-                    )
-                    for index, path in enumerate(
-                        self._pass_pngs(pass_path),
-                        start=1,
-                    )
-                )
-            return tasks
-        folder_result = self._qc_pipeline.validate_folder(
-            root_path=self._root_path,
-            date_name=item.date_name,
-            analysis_id=item.analysis_id,
-        )
         tasks: list[_ImageTask] = []
-        if folder_result.status != "PASS" and not force_qc:
-            return tasks
-
-        if folder_result.status == "PASS":
-            source_folders = [
-                (cell.cell_name, face_name, source_path)
-                for cell in folder_result.cells
-                for face_name, source_path in (("FRONT", cell.front_path), ("BACK", cell.back_path))
-                if source_path is not None
-            ]
-        else:
-            source_folders = self._forced_source_folders(item.analysis_path)
-
-        for cell_name, face_name, source_path in source_folders:
-            cell_number = self._cell_number_from_name(cell_name)
-            pass_path = source_path.parent / f"{face_name}_pass"
-            source_index = self._source_layer_index(source_path)
-            for fallback_index, path in enumerate(self._pass_pngs(pass_path), start=1):
-                image_num = source_index.get(path.stem, fallback_index)
-                tasks.append(_ImageTask(item.analysis_id, item.analysis_path, cell_number, face_name, image_num, path))
+        pass_path = self._preferred_work_pass_folder(item.analysis_path)
+        source_index = self._source_layer_index(item.analysis_path)
+        customer_code = self._selected_customer_code()
+        for fallback_index, path in enumerate(self._pass_pngs(pass_path), start=1):
+            image_num = source_index.get(path.stem, fallback_index)
+            tasks.append(_ImageTask(item.analysis_id, item.analysis_path, 1, "WORK", image_num, path, customer_code))
         return tasks
 
     def _task_label(self, task: _ImageTask) -> str:
@@ -3016,8 +3500,8 @@ class WorkflowTab(ttk.Frame):
                     child.path
                     for child in self._list_folder_children(folder_path)
                     if child.is_file
-                    and child.path.suffix.lower() == ".png"
-                    and not child.path.name.endswith("_mask.png")
+                    and child.path.suffix.lower() in _IMAGE_EXTENSIONS
+                    and not child.path.name.lower().endswith("_mask.png")
                 ],
                 key=lambda path: path.name,
             )
@@ -3044,23 +3528,35 @@ class WorkflowTab(ttk.Frame):
     def _mask_dir_for_task(self, task: _ImageTask) -> Path:
         if is_test_analysis_id(task.analysis_id) and task.face.upper() == "TEST":
             return get_test_mask_folder_for_pass(task.image_path.parent)
+        pass_folder = task.image_path.parent
+        pass_folder_name = pass_folder.name
+        if pass_folder_name.upper() == "_PASS":
+            return pass_folder.with_name("_MASK")
+        if pass_folder_name.lower().endswith("_pass"):
+            return pass_folder.with_name(f"{pass_folder_name[:-5]}_MASK")
         return task.image_path.parent.with_name(f"{task.face}_mask")
 
-    def _clear_mask_outputs_for_tasks(self, tasks: list[_ImageTask]) -> None:
+    def _clear_mask_outputs_for_tasks(self, tasks: list[_ImageTask], *, clear_masks: bool) -> None:
         mask_dirs = {self._mask_dir_for_task(task) for task in tasks}
         for mask_dir in mask_dirs:
             if not mask_dir.is_dir():
                 continue
             for path in mask_dir.iterdir():
-                if path.is_file() and path.suffix.lower() == ".png":
+                if not path.is_file():
+                    continue
+                if (clear_masks and path.suffix.lower() == ".png") or self._is_generated_li_salt_csv(path):
                     try:
                         path.unlink()
                     except OSError:
-                        logger.warning("Failed to remove stale mask output: %s", path, exc_info=True)
+                        logger.warning("Failed to remove stale ML output: %s", path, exc_info=True)
 
     def _write_csv(self, analysis_id: str, tasks: list[_ImageTask], rows: list[dict]) -> Path:
         average_percent = self._compute_average_li_salt_percent(tasks, rows)
-        csv_path = tasks[0].analysis_path / f"{analysis_id}_LI-SALT_{average_percent:.2f}%.csv"
+        csv_dir = self._mask_dir_for_task(tasks[0])
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = csv_dir / (
+            f"{analysis_id}_LI-SALT_{self._format_li_salt_percent(average_percent)}%.csv"
+        )
         pd.DataFrame(
             rows,
             columns=[
@@ -3074,8 +3570,24 @@ class WorkflowTab(ttk.Frame):
                 "li_salt_ratio",
                 "correction_applied",
             ],
-        ).to_csv(csv_path, index=False, float_format="%.2f")
+        ).to_csv(csv_path, index=False, float_format="%.6f")
         return csv_path
+
+    @staticmethod
+    def _is_generated_li_salt_csv(path: Path) -> bool:
+        name = path.name.upper()
+        return path.suffix.lower() == ".csv" and ("LI-SALT" in name or "LI_SALT" in name)
+
+    def _average_li_salt_percent_from_rows(self, rows: list[dict]) -> float | None:
+        values = []
+        for row in rows:
+            try:
+                values.append(float(row["li_salt_ratio"]) * 100.0)
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not values:
+            return None
+        return sum(values) / len(values)
 
     def _compute_average_li_salt_percent(self, tasks: list[_ImageTask], rows: list[dict]) -> float:
         row_map = {(row["Cell"], row["Face"], row["ImageNum"]): row for row in rows}
@@ -3102,7 +3614,7 @@ class WorkflowTab(ttk.Frame):
     def _toggle_preview(self) -> None:
         self._preview_enabled = bool(self._preview_var.get())
         if self._preview_enabled:
-            self._review_label.config(text="Select an AnalysisID to preview.")
+            self._review_label.config(text="Select a work folder to preview.")
         else:
             self._review_entries = []
             self._review_index = 0
@@ -3137,9 +3649,10 @@ class WorkflowTab(ttk.Frame):
             self._current_label.config(text=f"Current: {payload}")
         elif msg_type == "progress":
             if isinstance(payload, tuple):
-                processed, date_name, date_path, analysis_id = payload
+                processed, date_name, date_path, analysis_id, *rest = payload
+                analysis_path = Path(rest[0]) if rest else None
                 self._progress.configure(value=processed)
-                self._refresh_item_status(str(date_name), Path(date_path), str(analysis_id))
+                self._refresh_item_status(str(date_name), Path(date_path), str(analysis_id), analysis_path)
             else:
                 self._progress.configure(value=payload)
                 self._refresh_items()
@@ -3187,12 +3700,17 @@ class WorkflowTab(ttk.Frame):
                 self._status_label.config(text="Quick: no supported image files found")
         elif msg_type == "refresh":
             if isinstance(payload, tuple):
-                date_name, date_path, analysis_id = payload
-                self._refresh_item_status(str(date_name), Path(date_path), str(analysis_id))
+                date_name, date_path, analysis_id, *rest = payload
+                analysis_path = Path(rest[0]) if rest else None
+                self._refresh_item_status(str(date_name), Path(date_path), str(analysis_id), analysis_path)
             else:
                 self._refresh_items(clear_cache=True)
         elif msg_type == "qc_hold":
             self._handle_qc_hold(payload)
+        elif msg_type == "batch_qc_hold":
+            self._handle_batch_qc_hold(payload)
+        elif msg_type == "quick_qc_hold":
+            self._handle_quick_qc_hold(payload)
         elif msg_type == "qc_ng_action_done":
             self._handle_qc_ng_action_done(payload)
         elif msg_type == "preview":
@@ -3237,6 +3755,9 @@ class WorkflowTab(ttk.Frame):
         key = str(payload.get("key", ""))
         if not key:
             return
+        self._running = False
+        self._set_controls_enabled(True)
+        self._current_label.config(text="Current: -")
         failures = list(payload.get("failures", []))
         held = {
             "key": key,
@@ -3250,13 +3771,78 @@ class WorkflowTab(ttk.Frame):
         self._persist_qc_hold_state(held)
         analysis_id = payload.get("analysis_id", "-")
         self._status_label.config(
-            text=f"{analysis_id}: QC hold ({len(failures)} NG image(s))"
+            text=(
+                f"{analysis_id}: QC hold ({len(failures)} NG image(s)) - "
+                "choose Retake done or Crop anyway"
+            )
         )
         self._refresh_item_status(
             str(payload.get("date_name")),
             Path(payload.get("date_path")),
             str(payload.get("analysis_id")),
+            Path(payload.get("analysis_path")),
         )
+        self._show_held_qc_preview(key)
+
+    def _handle_batch_qc_hold(self, payload: dict) -> None:
+        key = str(payload.get("key", ""))
+        if not key:
+            return
+        self._running = False
+        self._set_controls_enabled(True)
+        self._current_label.config(text="Current: -")
+        failures = list(payload.get("failures", []))
+        held = {
+            "key": key,
+            "analysis_id": payload.get("analysis_id", "QC Failures"),
+            "analysis_path": payload.get("analysis_path") or self._root_path,
+            "batch_hold": True,
+            "failures": failures,
+        }
+        self._held_qc_failures[key] = held
+        self._status_label.config(
+            text=(
+                f"QC hold ({len(failures)} NG image(s)) - "
+                "review QC Failures"
+            )
+        )
+        self._refresh_items(clear_cache=True)
+        self._show_held_qc_preview(key)
+
+    def _handle_quick_qc_hold(self, payload: dict) -> None:
+        key = str(payload.get("key", ""))
+        if not key:
+            return
+        self._running = False
+        self._set_controls_enabled(True)
+        self._current_label.config(text="Current: -")
+        quick_path_value = payload.get("quick_path")
+        quick_path = Path(quick_path_value) if quick_path_value else None
+        failures = list(payload.get("failures", []))
+        held = {
+            "key": key,
+            "analysis_id": payload.get("analysis_id", "Folder"),
+            "analysis_path": payload.get("analysis_path")
+            or (quick_path.parent if quick_path is not None else self._root_path),
+            "quick_path": quick_path,
+            "batch_hold": bool(payload.get("batch_hold")),
+            "failures": failures,
+        }
+        self._held_qc_failures[key] = held
+        self._status_label.config(
+            text=(
+                f"{held['analysis_id']}: QC hold ({len(failures)} NG image(s)) - "
+                "choose Retake done or Crop anyway"
+            )
+        )
+        if quick_path is not None:
+            self._update_quick_tree_status(
+                {
+                    "path": quick_path,
+                    "status": "FAIL - QC hold",
+                    "output": "choose Retake done or Crop anyway",
+                }
+            )
         self._show_held_qc_preview(key)
 
     def _handle_qc_ng_action_done(self, payload: dict) -> None:
@@ -3268,6 +3854,8 @@ class WorkflowTab(ttk.Frame):
         if not held:
             return
         failures = list(held.get("failures", []))
+        quick_path = Path(held.get("quick_path", "")) if held.get("quick_path") else None
+        batch_hold = bool(held.get("batch_hold"))
         if status == "PASS":
             failures = [failure for failure in failures if str(failure.get("id")) != failure_id]
             held["failures"] = failures
@@ -3280,6 +3868,62 @@ class WorkflowTab(ttk.Frame):
             held["failures"] = failures
             self._status_label.config(text=f"{held.get('analysis_id', '-')}: NG still failed")
 
+        if quick_path is not None:
+            if failures:
+                self._held_qc_failures[held_key] = held
+                self._update_quick_tree_status(
+                    {
+                        "path": quick_path,
+                        "status": "FAIL - QC hold",
+                        "output": " | ".join(fail_reasons) or "QC failed",
+                    }
+                )
+                self._show_held_qc_preview(held_key)
+            else:
+                self._held_qc_failures.pop(held_key, None)
+                output_path = Path(payload.get("output_path", ""))
+                self._update_quick_tree_status(
+                    {
+                        "path": quick_path,
+                        "status": "PASS",
+                        "output": str(output_path.parent if output_path else ""),
+                    }
+                )
+                self._show_selected_preview()
+            return
+
+        if batch_hold:
+            self._sync_related_qc_holds(failure_id, status, fail_reasons)
+            failure_path = Path(failure_id)
+            if failure_path in self._quick_tree_by_path:
+                if status == "PASS":
+                    output_path = Path(payload.get("output_path", ""))
+                    self._update_quick_tree_status(
+                        {
+                            "path": failure_path,
+                            "status": "PASS",
+                            "output": str(output_path.parent if output_path else ""),
+                        }
+                    )
+                else:
+                    self._update_quick_tree_status(
+                        {
+                            "path": failure_path,
+                            "status": "FAIL - QC hold",
+                            "output": " | ".join(fail_reasons) or "QC failed",
+                        }
+                    )
+            if failures:
+                self._held_qc_failures[held_key] = held
+                self._show_held_qc_preview(held_key)
+            else:
+                self._held_qc_failures.pop(held_key, None)
+                self._set_qc_fail_entries([])
+                self._show_selected_preview()
+            if self._items:
+                self._refresh_items(clear_cache=True)
+            return
+
         if failures:
             self._held_qc_failures[held_key] = held
             self._persist_qc_hold_state(held)
@@ -3287,6 +3931,7 @@ class WorkflowTab(ttk.Frame):
                 str(held.get("date_name")),
                 Path(held.get("date_path")),
                 str(held.get("analysis_id")),
+                Path(held.get("analysis_path")),
             )
             self._show_held_qc_preview(held_key)
         else:
@@ -3296,8 +3941,40 @@ class WorkflowTab(ttk.Frame):
                 str(held.get("date_name")),
                 Path(held.get("date_path")),
                 str(held.get("analysis_id")),
+                Path(held.get("analysis_path")),
             )
             self._show_selected_preview()
+
+    def _sync_related_qc_holds(
+        self,
+        failure_id: str,
+        status: str,
+        fail_reasons: list[str],
+    ) -> None:
+        for key, held in list(self._held_qc_failures.items()):
+            if held.get("batch_hold") or held.get("quick_path"):
+                continue
+            failures = list(held.get("failures", []))
+            if not any(str(failure.get("id")) == failure_id for failure in failures):
+                continue
+            if status == "PASS":
+                failures = [
+                    failure
+                    for failure in failures
+                    if str(failure.get("id")) != failure_id
+                ]
+            else:
+                for failure in failures:
+                    if str(failure.get("id")) == failure_id:
+                        failure["fail_reasons"] = fail_reasons
+                        break
+            if failures:
+                held["failures"] = failures
+                self._held_qc_failures[key] = held
+                self._persist_qc_hold_state(held)
+            else:
+                self._held_qc_failures.pop(key, None)
+                self._delete_qc_hold_state(held)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -3313,9 +3990,10 @@ class WorkflowTab(ttk.Frame):
         self._sync_view_mode_options()
         self._mode_combo.config(state=combo_state)
         self._model_combo.config(state=combo_state)
+        self._customer_combo.config(state=combo_state)
         self._date_combo.config(
             state=tk.DISABLED
-            if self._mode_var.get() == "By Analysis ID" or self._is_folder_mode() or not enabled
+            if self._mode_var.get() == "By Work Folder" or self._is_folder_mode() or not enabled
             else "readonly"
         )
         self._tree.config(selectmode="extended")
@@ -3325,9 +4003,18 @@ class WorkflowTab(ttk.Frame):
 
     def _sync_run_mode_controls(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
+        if self._run_qc_var.get() and self._only_crop_var.get():
+            self._only_crop_var.set(False)
         self._run_qc_check.config(state=state)
+        only_crop_state = tk.DISABLED if (not enabled or self._run_qc_var.get()) else tk.NORMAL
+        self._only_crop_check.config(state=only_crop_state)
         self._run_ml_check.config(state=state)
-        self._run_btn.config(state=tk.NORMAL if enabled else tk.DISABLED)
+        has_run_option = (
+            bool(self._run_qc_var.get())
+            or bool(self._only_crop_var.get())
+            or bool(self._run_ml_var.get())
+        )
+        self._run_btn.config(state=tk.NORMAL if enabled and has_run_option else tk.DISABLED)
         self._sync_run_button_text()
 
     def _sync_run_button_text(self) -> None:
@@ -3361,10 +4048,10 @@ class WorkflowTab(ttk.Frame):
             self._review_count_label.config(text="")
             self._sync_review_nav_state()
             return
-        if item.qc_status != "DONE" or item.ml_status != "DONE":
+        if not self._qc_allows_ml(item.qc_status) or item.ml_status != "DONE":
             self._review_entries = []
             self._review_index = 0
-            self._review_label.config(text=f"{item.analysis_id} / Complete QC + ML first.")
+            self._review_label.config(text=f"{item.work_label or item.analysis_id} / Complete QC + ML first.")
             self._review_count_label.config(text="")
             self._before_canvas.delete("all")
             self._after_canvas.delete("all")
@@ -3388,6 +4075,7 @@ class WorkflowTab(ttk.Frame):
             return
         self._review_entries = self._build_held_qc_entries(held)
         self._review_index = 0
+        self._set_qc_fail_entries(self._review_entries)
         if not self._review_entries:
             self._review_label.config(text=f"{held.get('analysis_id', '-')} / No NG image found.")
             self._review_count_label.config(text="")
@@ -3396,6 +4084,84 @@ class WorkflowTab(ttk.Frame):
             self._sync_review_nav_state()
             return
         self._show_review_entry()
+
+    def _set_qc_fail_entries(self, entries: list[dict[str, object]]) -> None:
+        self._qc_fail_entries = list(entries)
+        self._qc_fail_index = 0
+        if not hasattr(self, "_qc_fail_tree"):
+            return
+        for item_id in self._qc_fail_tree.get_children():
+            self._qc_fail_tree.delete(item_id)
+        self._qc_fail_entry_by_tree_id.clear()
+        for entry in self._qc_fail_entries:
+            failure = dict(entry.get("failure", {}))
+            image_path = Path(failure.get("image_path", ""))
+            reason = " | ".join(str(reason) for reason in failure.get("fail_reasons", []))
+            item_id = self._qc_fail_tree.insert(
+                "",
+                tk.END,
+                values=(image_path.name, reason or "QC failed"),
+                tags=("qc_fail",),
+            )
+            self._qc_fail_entry_by_tree_id[item_id] = entry
+        if self._qc_fail_entries:
+            first_id = self._qc_fail_tree.get_children()[0]
+            self._qc_fail_tree.selection_set(first_id)
+            self._qc_fail_tree.see(first_id)
+            if hasattr(self, "_review_notebook") and hasattr(self, "_qc_fail_tab"):
+                self._review_notebook.select(self._qc_fail_tab)
+            self._show_qc_fail_entry()
+        else:
+            self._qc_fail_count_label.config(text="")
+            self._qc_fail_before_canvas.delete("all")
+            self._qc_fail_after_canvas.delete("all")
+            self._sync_qc_fail_nav_state()
+
+    def _on_qc_fail_select(self, _event=None) -> None:
+        if not hasattr(self, "_qc_fail_tree"):
+            return
+        selected = self._qc_fail_tree.selection()
+        if not selected:
+            return
+        entry = self._qc_fail_entry_by_tree_id.get(selected[0])
+        if entry not in self._qc_fail_entries:
+            return
+        self._qc_fail_index = self._qc_fail_entries.index(entry)
+        self._show_qc_fail_entry()
+
+    def _show_qc_fail_entry(self) -> None:
+        if not self._qc_fail_entries or not hasattr(self, "_qc_fail_before_canvas"):
+            return
+        self._qc_fail_index = max(0, min(self._qc_fail_index, len(self._qc_fail_entries) - 1))
+        entry = self._qc_fail_entries[self._qc_fail_index]
+        self._qc_fail_count_label.config(
+            text=f"{self._qc_fail_index + 1} / {len(self._qc_fail_entries)}"
+        )
+        tree_ids = self._qc_fail_tree.get_children()
+        if tree_ids:
+            self._qc_fail_tree.selection_set(tree_ids[self._qc_fail_index])
+            self._qc_fail_tree.see(tree_ids[self._qc_fail_index])
+        self._draw_image(
+            self._qc_fail_before_canvas,
+            entry.get("before"),
+            str(entry.get("before_title", "NG image")),
+        )
+        self._draw_image(
+            self._qc_fail_after_canvas,
+            entry.get("after"),
+            str(entry.get("after_title", "No pass output")),
+        )
+        self._sync_qc_fail_nav_state()
+
+    def _show_next_qc_fail(self) -> None:
+        if self._qc_fail_index < len(self._qc_fail_entries) - 1:
+            self._qc_fail_index += 1
+            self._show_qc_fail_entry()
+
+    def _show_previous_qc_fail(self) -> None:
+        if self._qc_fail_index > 0:
+            self._qc_fail_index -= 1
+            self._show_qc_fail_entry()
 
     def _normalize_preview_payload(self, payload) -> tuple[object, object, str, str, str]:
         if isinstance(payload, tuple) and len(payload) == 5:
@@ -3421,40 +4187,23 @@ class WorkflowTab(ttk.Frame):
         return entries
 
     def _build_existing_ml_tasks(self, item: _WorkflowItem) -> list[_ImageTask]:
-        if is_test_analysis_id(item.analysis_id):
-            tasks: list[_ImageTask] = []
-            for cell, source_folder in find_test_source_folders(item.analysis_path):
-                pass_path, _ = get_test_output_folders(item.analysis_path, source_folder)
-                tasks.extend(
-                    _ImageTask(
-                        item.analysis_id,
-                        item.analysis_path,
-                        cell,
-                        "TEST",
-                        index,
-                        path,
-                    )
-                    for index, path in enumerate(self._pass_pngs(pass_path), start=1)
-                )
-            return tasks
-
         tasks: list[_ImageTask] = []
-        for cell_name, face_name, source_path in self._forced_source_folders(item.analysis_path):
-            cell_number = self._cell_number_from_name(cell_name)
-            pass_path = source_path.parent / f"{face_name}_pass"
-            source_index = self._source_layer_index(source_path)
-            for fallback_index, path in enumerate(self._pass_pngs(pass_path), start=1):
-                image_num = source_index.get(path.stem, fallback_index)
-                tasks.append(
-                    _ImageTask(
-                        item.analysis_id,
-                        item.analysis_path,
-                        cell_number,
-                        face_name,
-                        image_num,
-                        path,
-                    )
+        pass_path = self._preferred_work_pass_folder(item.analysis_path)
+        source_index = self._source_layer_index(item.analysis_path)
+        customer_code = self._selected_customer_code()
+        for fallback_index, path in enumerate(self._pass_pngs(pass_path), start=1):
+            image_num = source_index.get(path.stem, fallback_index)
+            tasks.append(
+                _ImageTask(
+                    item.analysis_id,
+                    item.analysis_path,
+                    1,
+                    "WORK",
+                    image_num,
+                    path,
+                    customer_code,
                 )
+            )
         return tasks
 
     def _build_held_qc_entries(self, held: dict[str, object]) -> list[dict[str, object]]:
@@ -3547,6 +4296,22 @@ class WorkflowTab(ttk.Frame):
         ng_enabled = current_entry is not None and current_entry.get("type") == "qc_ng"
         self._retake_review_btn.config(state=tk.NORMAL if ng_enabled else tk.DISABLED)
         self._crop_review_btn.config(state=tk.NORMAL if ng_enabled else tk.DISABLED)
+        self._sync_qc_fail_nav_state()
+
+    def _sync_qc_fail_nav_state(self) -> None:
+        if not hasattr(self, "_retake_qc_fail_btn"):
+            return
+        has_entries = bool(self._qc_fail_entries)
+        self._prev_qc_fail_btn.config(
+            state=tk.NORMAL if has_entries and self._qc_fail_index > 0 else tk.DISABLED
+        )
+        self._next_qc_fail_btn.config(
+            state=tk.NORMAL
+            if has_entries and self._qc_fail_index < len(self._qc_fail_entries) - 1
+            else tk.DISABLED
+        )
+        self._retake_qc_fail_btn.config(state=tk.NORMAL if has_entries else tk.DISABLED)
+        self._crop_qc_fail_btn.config(state=tk.NORMAL if has_entries else tk.DISABLED)
 
     def _review_can_navigate(self) -> bool:
         if not self._review_entries:
@@ -3564,6 +4329,16 @@ class WorkflowTab(ttk.Frame):
 
     def _process_current_qc_ng(self, *, force: bool) -> None:
         entry = self._current_review_entry()
+        self._process_qc_ng_entry(entry, force=force)
+
+    def _process_current_qc_fail_ng(self, *, force: bool) -> None:
+        entry = None
+        if self._qc_fail_entries:
+            index = max(0, min(self._qc_fail_index, len(self._qc_fail_entries) - 1))
+            entry = self._qc_fail_entries[index]
+        self._process_qc_ng_entry(entry, force=force)
+
+    def _process_qc_ng_entry(self, entry: dict[str, object] | None, *, force: bool) -> None:
         if entry is None or entry.get("type") != "qc_ng":
             return
         failure = dict(entry.get("failure", {}))
@@ -3573,6 +4348,9 @@ class WorkflowTab(ttk.Frame):
             return
         self._retake_review_btn.config(state=tk.DISABLED)
         self._crop_review_btn.config(state=tk.DISABLED)
+        if hasattr(self, "_retake_qc_fail_btn"):
+            self._retake_qc_fail_btn.config(state=tk.DISABLED)
+            self._crop_qc_fail_btn.config(state=tk.DISABLED)
         action = "Crop anyway" if force else "Retake done"
         self._status_label.config(text=f"{action}: {Path(failure['image_path']).name}")
 
@@ -3587,6 +4365,7 @@ class WorkflowTab(ttk.Frame):
                             "failure_id": failure_id,
                             "status": result.status,
                             "fail_reasons": list(result.fail_reasons),
+                            "output_path": str(result.output_path or failure.get("output_path", "")),
                         },
                     )
                 )
@@ -3657,7 +4436,3 @@ class WorkflowTab(ttk.Frame):
         while len(self._photo_cache_order) > 32:
             old_key = self._photo_cache_order.pop(0)
             self._photo_cache.pop(old_key, None)
-
-
-
-

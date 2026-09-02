@@ -138,7 +138,7 @@ class GuideTab(ttk.Frame):
             ("일반 ML 결과", "ML mask와 AnalysisID 단위 CSV가 기존 workflow 규칙에 맞게 저장되고 SQLite monitoring DB에도 기록됩니다."),
             ("Quick crop 결과", "원본 폴더가 FRONT이면 crop 이미지는 원본의 형제 폴더 FRONT_PASS에 image01.png 형식으로 저장됩니다."),
             ("Quick mask 결과", "ML mask는 FRONT_MASK 또는 BACK_MASK 폴더에 image01_mask.png 형식으로 저장됩니다."),
-            ("Quick CSV 결과", "CSV는 mask 폴더에 image01_LI_SALT_12.35%.csv 형식으로 저장됩니다. 퍼센트는 ML 결과 li_salt_ratio를 100배 한 값입니다."),
+            ("Quick CSV 결과", "CSV는 mask 폴더에 작업 폴더별 통합 파일로 저장됩니다. 예: issue_LI-SALT_12.35%.csv"),
             ("저장 실패", "팀룸에 결과를 복사할 수 없으면 오류 메시지에 실패 대상 폴더와 로컬 fallback TEMP 위치가 표시됩니다."),
         ]
         return self._add_section(parent, row, "결과 저장 위치", body)

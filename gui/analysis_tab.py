@@ -1,16 +1,21 @@
 import logging
 import re
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pandas as pd
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 import yaml
 
-from modules.utils import path_resolver
+try:
+    from PIL import ImageGrab
+except ImportError:  # pragma: no cover - depends on deployment package.
+    ImageGrab = None
+
 from modules.utils.analysis_id import (
     find_test_source_folders,
     get_test_mask_folder_for_pass,
@@ -22,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 _RESULT_PATTERN_OLD = "{analysis_id}_result.csv"
 _RESULT_PATTERN_NEW = "{analysis_id}_LI-SALT_*.csv"
-_IMAGE_EXTENSIONS = {".png"}
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 _C_AXIS = "#555555"
 _C_GRID = "#dddddd"
@@ -64,26 +69,13 @@ _FACE_MODES = (
 @dataclass(frozen=True)
 class _ResultOption:
     key: str
+    date_name: str
     analysis_id: str
     analysis_path: Path
     csv_path: Path
     cell: int
     label: str
     result_summary: str
-
-
-@dataclass(frozen=True)
-class _ResultRow:
-    key: str
-    option_key: str
-    option: _ResultOption
-    point: "_SeriesPoint"
-    display_path: str
-    face: str
-    li_salt_percent: float
-    modified_text: str
-    modified_ts: float
-    csv_display: str
 
 
 @dataclass(frozen=True)
@@ -99,6 +91,25 @@ class _SeriesPoint:
     mask_image: Path | None
 
 
+@dataclass(frozen=True)
+class _ResultRow:
+    key: str
+    date_name: str
+    work_label: str
+    display_path: str
+    analysis_id: str
+    analysis_path: Path
+    csv_path: Path
+    cell: int
+    face: str
+    image_num: int
+    li_salt_percent: float
+    nonactive_percent: float | None
+    pass_image: Path | None
+    mask_image: Path | None
+    row: dict
+
+
 class AnalysisTab(ttk.Frame):
     """Visual analysis view for ML result CSVs."""
 
@@ -107,23 +118,17 @@ class AnalysisTab(ttk.Frame):
         self._config_path = Path(config_path)
         self._load_config()
 
-        self._analysis_root_path = self._root_path
-        self._root_path_var = tk.StringVar(value=str(self._root_path))
-        self._folder_listing_cache = path_resolver.FolderListingCache()
+        self._date_values: list[str] = []
         self._result_options: list[_ResultOption] = []
         self._option_by_item: dict[str, _ResultOption] = {}
-        self._option_by_key: dict[str, _ResultOption] = {}
-        self._result_rows: list[_ResultRow] = []
+        self._option_rows_by_item: dict[str, list[_ResultRow]] = {}
         self._row_by_item: dict[str, _ResultRow] = {}
-        self._points_by_option: dict[str, list[_SeriesPoint]] = {}
         self._selected_options: dict[str, _ResultOption] = {}
-        self._active_result_item: str | None = None
-        self._result_sort_column = "csv"
-        self._result_sort_desc = False
         self._all_series_points: list[_SeriesPoint] = []
         self._canvas_points: list[tuple[float, float, _SeriesPoint]] = []
         self._overlap_points: list[_SeriesPoint] = []
         self._shown_point: _SeriesPoint | None = None
+        self._active_result_item: str | None = None
         self._heatmap_option_key: str | None = None
         self._heatmap_counts_cache: dict[
             tuple[str, str, tuple[tuple[str, int, int], ...]],
@@ -132,20 +137,15 @@ class AnalysisTab(ttk.Frame):
         self._photo_refs: list[tk.PhotoImage] = []
 
         self._build_ui()
-        self._reset_results("Load a root path to browse completed ML results.")
-
-    def reload_config(self) -> None:
-        self._load_config()
-        self._root_path_var.set(str(self._root_path))
-        self._analysis_root_path = self._root_path
-        self._folder_listing_cache.clear()
-        self._reset_results("Settings reloaded. Load a root path to browse results.")
+        self._load_dates()
 
     def _load_config(self) -> None:
         with open(self._config_path, encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh)
+            cfg = yaml.safe_load(fh) or {}
+        folder_cfg = cfg.get("folder_qc", {}) or {}
         self._root_path = Path(cfg["app"]["root_path"])
-        self._analysis_id_re = re.compile(cfg["folder_qc"]["analysis_id_pattern"])
+        self._analysis_id_re = re.compile(folder_cfg["analysis_id_pattern"])
+        self._date_formats = list(folder_cfg.get("date_formats") or ["%Y-%m-%d"])
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=0)
@@ -155,21 +155,22 @@ class AnalysisTab(ttk.Frame):
 
         header = ttk.Frame(self)
         header.grid(row=0, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(10, 6))
-        header.columnconfigure(1, weight=1)
+        header.columnconfigure(4, weight=1)
 
-        ttk.Label(header, text="Root Path").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
-        self._root_path_entry = ttk.Entry(header, textvariable=self._root_path_var)
-        self._root_path_entry.grid(row=0, column=1, sticky=tk.EW)
-        self._root_path_entry.bind("<Return>", lambda _event: self._load_root_path())
-        self._root_path_entry.bind("<KP_Enter>", lambda _event: self._load_root_path())
-        ttk.Button(header, text="Load Path", command=self._load_root_path).grid(
-            row=0, column=2, sticky=tk.W, padx=(8, 0)
-        )
-        ttk.Button(header, text="Refresh", command=self._refresh).grid(
-            row=0, column=3, sticky=tk.W, padx=(8, 0)
-        )
+        self._root_path_var = tk.StringVar(value=str(self._root_path))
 
-        ttk.Label(header, text="View").grid(row=0, column=4, sticky=tk.W, padx=(12, 6))
+        ttk.Label(header, text="Date").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
+        self._date_var = tk.StringVar()
+        self._date_combo = ttk.Combobox(
+            header,
+            textvariable=self._date_var,
+            state="readonly",
+            width=18,
+        )
+        self._date_combo.grid(row=0, column=1, sticky=tk.W)
+        self._date_combo.bind("<<ComboboxSelected>>", self._on_date_change)
+
+        ttk.Label(header, text="View").grid(row=0, column=2, sticky=tk.W, padx=(10, 6))
         self._face_mode_var = tk.StringVar(value="FRONT")
         self._face_mode_combo = ttk.Combobox(
             header,
@@ -178,53 +179,51 @@ class AnalysisTab(ttk.Frame):
             state="readonly",
             width=14,
         )
-        self._face_mode_combo.grid(row=0, column=5, sticky=tk.W)
+        self._face_mode_combo.grid(row=0, column=3, sticky=tk.W)
         self._face_mode_combo.bind("<<ComboboxSelected>>", self._on_face_mode_change)
 
+        ttk.Button(header, text="Refresh", command=self._refresh).grid(
+            row=0, column=4, sticky=tk.W, padx=(8, 0)
+        )
         ttk.Button(header, text="Clear graph", command=self._clear_graph).grid(
+            row=0, column=5, sticky=tk.W, padx=(8, 0)
+        )
+        ttk.Button(header, text="Export data", command=self._export_data).grid(
             row=0, column=6, sticky=tk.W, padx=(8, 0)
         )
+        ttk.Button(header, text="Capture screen", command=self._capture_screen).grid(
+            row=0, column=7, sticky=tk.W, padx=(8, 0)
+        )
         self._status_label = ttk.Label(header, text="", foreground=_C_MUTED)
-        self._status_label.grid(row=0, column=7, sticky=tk.W, padx=(12, 0))
+        self._status_label.grid(row=0, column=8, sticky=tk.W, padx=(12, 0))
 
-        left = ttk.Frame(self)
+        left = ttk.LabelFrame(self, text="ML Results", padding=8)
         left.grid(row=1, column=0, sticky=tk.NS, padx=(10, 6), pady=(0, 8))
         left.rowconfigure(0, weight=1)
 
-        results_frame = ttk.LabelFrame(left, text="ML Results", padding=8)
-        results_frame.grid(row=0, column=0, sticky=tk.NSEW)
-        results_frame.rowconfigure(0, weight=1)
-        results_frame.columnconfigure(0, weight=1)
-
-        columns = ("face", "li_salt", "modified", "csv")
+        columns = ("face", "li_salt", "result")
         self._result_tree = ttk.Treeview(
-            results_frame,
+            left,
             columns=columns,
             show="tree headings",
-            height=22,
-            selectmode="browse",
+            height=18,
+            selectmode="none",
         )
-        self._result_tree.heading("#0", text="Analysis ID / Image", command=lambda: self._sort_results("image"))
-        self._result_tree.heading("face", text="FRONT/BACK", command=lambda: self._sort_results("face"))
-        self._result_tree.heading("li_salt", text="LI_SALT %", command=lambda: self._sort_results("li_salt"))
-        self._result_tree.heading("modified", text="Modified", command=lambda: self._sort_results("modified"))
-        self._result_tree.heading("csv", text="CSV", command=lambda: self._sort_results("csv"))
-        self._result_tree.column("#0", width=250, anchor=tk.W, stretch=True)
-        self._result_tree.column("face", width=82, anchor=tk.W)
-        self._result_tree.column("li_salt", width=82, anchor=tk.E)
-        self._result_tree.column("modified", width=126, anchor=tk.W)
-        self._result_tree.column("csv", width=180, anchor=tk.W)
-        self._result_tree.grid(row=0, column=0, sticky=tk.NSEW)
+        self._result_tree.heading("#0", text="Date / Work Folder / Image")
+        self._result_tree.heading("face", text="Face", command=lambda: self._sort_results("face"))
+        self._result_tree.heading("li_salt", text="Li-salt %", command=lambda: self._sort_results("li_salt"))
+        self._result_tree.heading("result", text="Li-salt / Nonactive")
+        self._result_tree.column("#0", width=220, anchor=tk.W)
+        self._result_tree.column("face", width=70, anchor=tk.W)
+        self._result_tree.column("li_salt", width=75, anchor=tk.E)
+        self._result_tree.column("result", width=175, anchor=tk.W)
+        self._result_tree.grid(row=0, column=0, sticky=tk.NS)
         self._result_tree.tag_configure("selected", background=_C_SELECTED)
         self._result_tree.bind("<Button-1>", self._on_result_click)
 
-        tree_scroll = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self._result_tree.yview)
+        tree_scroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self._result_tree.yview)
         tree_scroll.grid(row=0, column=1, sticky=tk.NS)
         self._result_tree.configure(yscrollcommand=tree_scroll.set)
-        x_scroll = ttk.Scrollbar(results_frame, orient=tk.HORIZONTAL, command=self._result_tree.xview)
-        x_scroll.grid(row=1, column=0, sticky=tk.EW)
-        self._result_tree.configure(xscrollcommand=x_scroll.set)
-        self._setup_root_drag_drop()
 
         graph_frame = ttk.LabelFrame(self, text="Analysis view", padding=8)
         graph_frame.grid(row=1, column=1, sticky=tk.NSEW, padx=(6, 10), pady=(0, 8))
@@ -266,7 +265,7 @@ class AnalysisTab(ttk.Frame):
         self._heatmap_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._redraw_heatmap())
         self._heatmap_label = ttk.Label(
             heatmap_controls,
-            text="Click an ML result on the left to build a heatmap.",
+            text="Click a cell result on the left to build a heatmap.",
             foreground=_C_MUTED,
         )
         self._heatmap_label.grid(row=0, column=2, columnspan=2, sticky=tk.W)
@@ -280,7 +279,7 @@ class AnalysisTab(ttk.Frame):
         images.columnconfigure(0, weight=1)
         images.columnconfigure(1, weight=1)
 
-        self._selection_label = ttk.Label(images, text="Click an ML result to inspect images.")
+        self._selection_label = ttk.Label(images, text="Click a graph point to inspect images.")
         self._selection_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 6))
 
         self._overlap_var = tk.StringVar()
@@ -299,70 +298,23 @@ class AnalysisTab(ttk.Frame):
         self._mask_canvas = tk.Canvas(images, bg="#f5f5f5", height=230, highlightthickness=1)
         self._mask_canvas.grid(row=1, column=1, sticky=tk.EW, padx=(5, 0))
 
-    def _setup_root_drag_drop(self) -> None:
-        try:
-            self.tk.call("package", "require", "tkdnd")
-            for widget in (self._root_path_entry, self._result_tree):
-                self.tk.call("tkdnd::drop_target", "register", widget, "DND_Files")
-                widget.bind("<<Drop>>", self._on_root_drop, add="+")
-        except tk.TclError:
-            pass
+    def reload_settings(self) -> None:
+        self._load_config()
+        self._load_dates()
 
-    def _on_root_drop(self, event) -> str:
-        paths = self._parse_dropped_paths(getattr(event, "data", ""))
-        if paths:
-            self._root_path_var.set(paths[0])
-            self._load_root_path()
-        return "break"
-
-    def _parse_dropped_paths(self, data: str) -> list[str]:
-        text = str(data or "").strip()
-        if not text:
-            return []
-        if "\n" in text or "\r" in text or ";" in text:
-            paths: list[str] = []
-            for chunk in re.split(r"[\r\n;]+", text):
-                paths.extend(self._parse_dropped_paths(chunk))
-            return paths
-        if re.match(r"^[A-Za-z]:(?:[\\/]|[^\\/])", text):
-            return [path_resolver.clean_path(text)]
-        try:
-            parts = list(self.tk.splitlist(text))
-        except tk.TclError:
-            parts = [text]
-        return [path_resolver.clean_path(part) for part in parts if str(part).strip()]
+    def _load_dates(self) -> None:
+        self._date_values = self._list_date_folders()
+        self._date_combo["values"] = self._date_values
+        selected = self._pick_default_date(self._date_values)
+        self._date_var.set(selected)
+        self._load_results()
 
     def _refresh(self) -> None:
-        self._load_root_path(clear_cache=True)
+        self._load_config()
+        self._load_dates()
 
-    def _load_root_path(self, clear_cache: bool = False) -> None:
-        root_text = self._root_path_var.get().strip()
-        if not root_text:
-            self._reset_results("Enter a Root Path.")
-            return
-        if clear_cache:
-            self._folder_listing_cache.clear()
-        root_path = path_resolver.resolve_path(root_text)
-        self._analysis_root_path = root_path
-        self._root_path_var.set(str(root_path))
-        self._reset_results("Loading ML results...")
-        self.update_idletasks()
-        try:
-            rows = self._discover_result_rows(root_path)
-        except OSError as exc:
-            self._reset_results(f"Failed to load results: {exc}")
-            return
-        self._set_result_rows(rows)
-        self._status_label.config(text=f"Loaded {len(rows)} ML result(s) from {root_path}")
-
-    def _relative_path_label(self, path: Path | None) -> str:
-        if path is None:
-            return "-"
-        try:
-            relative = path.relative_to(self._analysis_root_path)
-            return str(relative) if str(relative) != "." else "."
-        except ValueError:
-            return path.name or str(path)
+    def _on_date_change(self, _event=None) -> None:
+        self._load_results()
 
     def _on_face_mode_change(self, _event=None) -> None:
         self._clear_images()
@@ -380,146 +332,211 @@ class AnalysisTab(ttk.Frame):
         except tk.TclError:
             return False
 
-    def _reset_results(self, status: str = "") -> None:
+    def _list_date_folders(self) -> list[str]:
+        if not self._root_path.exists():
+            return []
+        dated: list[tuple[datetime, str]] = []
+        for path in self._root_path.iterdir():
+            if not path.is_dir():
+                continue
+            parsed = self._parse_date_folder(path.name)
+            if parsed is not None:
+                dated.append((parsed, path.name))
+        dated.sort(key=lambda item: item[0], reverse=True)
+        return [name for _, name in dated]
+
+    def _parse_date_folder(self, folder_name: str) -> datetime | None:
+        for fmt in self._date_formats:
+            try:
+                return datetime.strptime(folder_name, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _pick_default_date(self, date_names: list[str]) -> str:
+        if not date_names:
+            return ""
+        today_value = date.today()
+        for name in date_names:
+            parsed = self._parse_date_folder(name)
+            if parsed is not None and parsed.date() == today_value:
+                return name
+        return date_names[0]
+
+    def _load_root_path(self, clear_cache: bool = False) -> None:
+        del clear_cache
+        raw_path = self._root_path_var.get().strip()
+        if raw_path:
+            self._root_path = Path(raw_path)
+        self._date_values = self._list_date_folders()
+        self._date_combo["values"] = self._date_values
+        if self._date_values and self._date_var.get() not in self._date_values:
+            self._date_var.set(self._pick_default_date(self._date_values))
+        rows = self._discover_result_rows(self._root_path)
+        self._set_result_rows(rows)
+        self._status_label.config(text=f"Loaded {len(rows)} result row(s) from {self._root_path}")
+
+    def _load_results(self) -> None:
+        if hasattr(self, "_root_path_var"):
+            self._load_root_path()
+            return
         for item in self._result_tree.get_children():
             self._result_tree.delete(item)
         self._option_by_item.clear()
-        self._option_by_key.clear()
-        self._row_by_item.clear()
-        self._points_by_option.clear()
-        self._result_rows.clear()
         self._result_options.clear()
         self._selected_options.clear()
-        self._active_result_item = None
         self._all_series_points.clear()
         self._overlap_points.clear()
         self._shown_point = None
         self._heatmap_option_key = None
         self._heatmap_counts_cache.clear()
         self._clear_images()
-        if status:
-            self._status_label.config(text=status)
-        self._redraw_graph()
-        self._redraw_heatmap()
 
-    def _set_result_rows(self, rows: list[_ResultRow]) -> None:
-        self._result_rows = list(rows)
-        self._sort_result_rows()
-        group_items: dict[str, str] = {}
-        for row in self._result_rows:
-            group_key = f"{row.option.analysis_path}|{row.option.analysis_id}"
-            group_id = group_items.get(group_key)
-            if group_id is None:
-                group_id = self._result_tree.insert(
-                    "",
-                    tk.END,
-                    text=row.option.analysis_id,
-                    values=("", "", "", self._relative_path_label(row.option.csv_path)),
-                    open=True,
-                )
-                group_items[group_key] = group_id
+        date_name = self._date_var.get().strip()
+        date_path = self._root_path / date_name if date_name else None
+        if date_path is None or not date_path.is_dir():
+            self._status_label.config(text="No date selected")
+            self._redraw_graph()
+            return
+
+        options = self._discover_result_options(date_name, date_path)
+        self._result_options = options
+        for option in options:
             item_id = self._result_tree.insert(
-                group_id,
+                "",
                 tk.END,
-                text=row.display_path,
-                values=(
-                    row.face,
-                    f"{row.li_salt_percent:.2f}",
-                    row.modified_text,
-                    row.csv_display,
-                ),
+                values=(option.analysis_id, f"#{option.cell}", option.result_summary),
             )
-            self._row_by_item[item_id] = row
-            self._option_by_item[item_id] = row.option
-        self._sync_result_tree_styles()
+            self._option_by_item[item_id] = option
+
+        self._status_label.config(text=f"{len(options)} cell result(s)")
         self._redraw_graph()
         self._redraw_heatmap()
-
-    def _sort_results(self, column: str) -> None:
-        if self._result_sort_column == column:
-            self._result_sort_desc = not self._result_sort_desc
-        else:
-            self._result_sort_column = column
-            self._result_sort_desc = column == "modified"
-        for item in self._result_tree.get_children():
-            self._result_tree.delete(item)
-        self._row_by_item.clear()
-        self._option_by_item.clear()
-        self._set_result_rows(self._result_rows)
-
-    def _sort_result_rows(self) -> None:
-        column = self._result_sort_column
-        reverse = self._result_sort_desc
-        if column == "li_salt":
-            key = lambda row: (row.li_salt_percent, row.display_path.lower())
-        elif column == "face":
-            key = lambda row: (row.face.upper(), row.display_path.lower())
-        elif column == "image":
-            key = lambda row: row.display_path.lower()
-        elif column == "csv":
-            key = lambda row: (row.csv_display.lower(), row.display_path.lower())
-        else:
-            key = lambda row: (row.modified_ts, row.display_path.lower())
-        self._result_rows.sort(key=key, reverse=reverse)
 
     def _discover_result_rows(self, root_path: Path) -> list[_ResultRow]:
-        options_by_key: dict[str, _ResultOption] = {}
-        points_by_option: dict[str, list[_SeriesPoint]] = {}
-        rows_by_identity: dict[str, _ResultRow] = {}
-        for csv_path in self._iter_result_csvs(root_path):
-            for row in self._rows_from_csv(csv_path, options_by_key, points_by_option):
-                existing = rows_by_identity.get(row.key)
-                if existing is None or row.modified_ts >= existing.modified_ts:
-                    rows_by_identity[row.key] = row
-
-        self._option_by_key = options_by_key
-        self._result_options = list(options_by_key.values())
-        self._points_by_option = {
-            key: sorted(points, key=lambda point: (point.face.upper(), point.image_num))
-            for key, points in points_by_option.items()
-        }
-        return list(rows_by_identity.values())
-
-    def _iter_result_csvs(self, root_path: Path) -> list[Path]:
-        csvs: list[Path] = []
-        stack = [root_path]
-        seen_dirs: set[str] = set()
-        while stack:
-            folder = stack.pop()
-            folder_key = str(folder).lower()
-            if folder_key in seen_dirs:
+        rows: list[_ResultRow] = []
+        seen_mask_keys: set[tuple[Path, str]] = set()
+        if not root_path.exists():
+            return rows
+        for csv_path in sorted(root_path.rglob("*.csv"), key=lambda path: str(path).lower()):
+            if not self._is_generated_li_salt_csv(csv_path) and not csv_path.name.endswith("_result.csv"):
                 continue
-            seen_dirs.add(folder_key)
-            try:
-                children = self._folder_listing_cache.children(folder, allow_fallback=True)
-            except OSError:
-                continue
-            for child in children:
-                name = child.path.name
-                lower = name.lower()
-                if child.is_dir:
-                    if lower.endswith("_pass"):
-                        continue
-                    stack.append(child.path)
-                elif child.is_file and lower.endswith(".csv") and self._is_result_csv_name(name):
-                    csvs.append(child.path)
-        return sorted(csvs, key=lambda path: str(path).lower())
+            rows.extend(self._rows_from_csv(root_path, csv_path))
+            for row in rows:
+                if row.mask_image is not None:
+                    seen_mask_keys.add((row.mask_image.parent, row.mask_image.stem))
+        for mask_dir in self._iter_mask_folders(root_path):
+            for mask_image in sorted(mask_dir.glob("*_mask.png"), key=lambda path: path.name.lower()):
+                if (mask_image.parent, mask_image.stem) in seen_mask_keys:
+                    continue
+                derived = self._row_from_mask(root_path, mask_image)
+                if derived is not None:
+                    rows.append(derived)
+        return rows
 
-    def _is_result_csv_name(self, name: str) -> bool:
-        lower = name.lower()
-        return (
-            lower.endswith("_result.csv")
-            or "_li-salt_" in lower
-            or "_li_salt_" in lower
-            or lower.endswith("_li_salt.csv")
+    def _set_result_rows(self, rows: list[_ResultRow]) -> None:
+        for item in self._result_tree.get_children():
+            self._result_tree.delete(item)
+        self._option_by_item.clear()
+        self._option_rows_by_item.clear()
+        self._row_by_item.clear()
+        self._result_options.clear()
+        self._selected_options.clear()
+        self._all_series_points.clear()
+        self._overlap_points.clear()
+        self._shown_point = None
+        self._active_result_item = None
+        self._heatmap_option_key = None
+        self._heatmap_counts_cache.clear()
+        self._clear_images()
+
+        grouped: dict[str, dict[str, list[_ResultRow]]] = {}
+        row_order = {row.key: index for index, row in enumerate(rows)}
+        for row in rows:
+            grouped.setdefault(row.date_name, {}).setdefault(row.work_label, []).append(row)
+
+        for date_name in sorted(grouped.keys(), key=lambda name: min(row_order[row.key] for group in grouped[name].values() for row in group)):
+            date_id = self._result_tree.insert("", tk.END, text=date_name, open=True, values=("", "", ""))
+            for work_label in sorted(grouped[date_name].keys(), key=lambda label: min(row_order[row.key] for row in grouped[date_name][label])):
+                work_rows = sorted(grouped[date_name][work_label], key=lambda row: row_order[row.key])
+                option = self._option_from_rows(work_rows)
+                option_id = self._result_tree.insert(date_id, tk.END, text=work_label, open=True, values=("", "", option.result_summary))
+                self._option_by_item[option_id] = option
+                self._option_rows_by_item[option_id] = work_rows
+                self._result_options.append(option)
+                for row in work_rows:
+                    item_id = self._result_tree.insert(
+                        option_id,
+                        tk.END,
+                        text=row.display_path,
+                        values=(
+                            row.face,
+                            self._format_li_salt_percent(row.li_salt_percent),
+                            self._row_result_summary(row),
+                        ),
+                    )
+                    self._row_by_item[item_id] = row
+        self._redraw_graph()
+        self._redraw_heatmap()
+
+    def _option_from_rows(self, rows: list[_ResultRow]) -> _ResultOption:
+        first = rows[0]
+        li_avg = sum(row.li_salt_percent for row in rows) / len(rows)
+        nonactive_values = [row.nonactive_percent for row in rows if row.nonactive_percent is not None]
+        if nonactive_values:
+            summary = f"Li {li_avg:.2f}% / Nonactive {sum(nonactive_values) / len(nonactive_values):.2f}%"
+        else:
+            summary = f"Li {li_avg:.2f}% / Nonactive -"
+        return _ResultOption(
+            key=f"{first.date_name}|{first.work_label}",
+            date_name=first.date_name,
+            analysis_id=first.analysis_id,
+            analysis_path=first.analysis_path,
+            csv_path=first.csv_path,
+            cell=first.cell,
+            label=first.work_label,
+            result_summary=summary,
         )
 
-    def _rows_from_csv(
-        self,
-        csv_path: Path,
-        options_by_key: dict[str, _ResultOption],
-        points_by_option: dict[str, list[_SeriesPoint]],
-    ) -> list[_ResultRow]:
+    def _discover_result_options(self, date_name: str, date_path: Path) -> list[_ResultOption]:
+        options: list[_ResultOption] = []
+        for analysis_path in sorted(
+            [
+                p for p in date_path.iterdir()
+                if p.is_dir() and self._is_analysis_folder(p.name)
+            ],
+            key=lambda p: p.name,
+        ):
+            csv_path = self._find_result_csv(analysis_path, analysis_path.name)
+            if csv_path is None:
+                continue
+            try:
+                frame = pd.read_csv(csv_path)
+            except Exception:
+                logger.exception("Failed to read result CSV: %s", csv_path)
+                continue
+            if "Cell" not in frame.columns or "li_salt_ratio" not in frame.columns:
+                continue
+            numeric_cells = pd.to_numeric(frame["Cell"], errors="coerce")
+            cells = sorted({int(value) for value in numeric_cells.dropna().unique()})
+            for cell in cells:
+                key = f"{date_name}|{analysis_path.name}|{cell}|{csv_path.name}"
+                result_summary = self._cell_result_summary(frame, cell)
+                options.append(
+                    _ResultOption(
+                        key=key,
+                        date_name=date_name,
+                        analysis_id=analysis_path.name,
+                        analysis_path=analysis_path,
+                        csv_path=csv_path,
+                        cell=cell,
+                        label=f"{analysis_path.name} Cell #{cell}",
+                        result_summary=result_summary,
+                    )
+                )
+        return options
+
+    def _rows_from_csv(self, root_path: Path, csv_path: Path) -> list[_ResultRow]:
         try:
             frame = pd.read_csv(csv_path)
         except Exception:
@@ -527,151 +544,147 @@ class AnalysisTab(ttk.Frame):
             return []
         if frame.empty:
             frame = pd.DataFrame([{}])
-
-        analysis_path = self._analysis_path_for_csv(csv_path)
-        filename_percent = self._percent_from_filename(csv_path)
         rows: list[_ResultRow] = []
-        for index, series in frame.iterrows():
-            row_dict = series.to_dict()
-            percent = self._li_salt_percent_from_row(row_dict, filename_percent)
-            if percent is None:
+        for index, record in frame.iterrows():
+            row_dict = record.to_dict()
+            li_percent = self._li_salt_percent_from_row(row_dict, csv_path)
+            if li_percent is None:
                 continue
-            cell = self._int_from_row(row_dict, "Cell", "cell", default=1)
-            image_num = self._int_from_row(row_dict, "ImageNum", "image_num", default=index + 1)
-            analysis_id = self._analysis_id_for_row(row_dict, analysis_path)
-            face = self._face_for_row(row_dict, csv_path)
-            pass_image = self._path_from_row(
-                row_dict,
-                csv_path,
-                "crop_image",
-                "pass_image_path",
-                "pass_image",
-            )
-            mask_image = self._path_from_row(row_dict, csv_path, "mask_image", "mask_path")
-            if pass_image is None and mask_image is not None:
-                pass_image = self._pass_image_for_mask(mask_image)
-            if pass_image is None:
-                pass_image = self._find_pass_image(analysis_path, cell, face, image_num)
+            nonactive_percent = self._nonactive_percent_from_row(row_dict)
+            face = self._clean_text(row_dict.get("Face")) or self._face_from_path(csv_path)
+            image_num = self._int_value(row_dict.get("ImageNum"), index + 1)
+            cell = self._int_value(row_dict.get("Cell"), 1)
+            mask_image = self._path_from_value(row_dict.get("mask_image"))
+            crop_image = self._path_from_value(row_dict.get("crop_image"))
+            source_image = self._path_from_value(row_dict.get("source_image"))
+            analysis_path = self._analysis_path_for_csv(csv_path)
             if mask_image is None:
-                mask_image = self._find_mask_image(pass_image, face)
-            face = self._infer_face(face, csv_path, pass_image, mask_image)
-            row_dict.setdefault("li_salt_ratio", percent / 100.0)
-
-            option_key = f"{analysis_path}|{cell}|{csv_path.name}"
-            option = options_by_key.get(option_key)
-            if option is None:
-                option = _ResultOption(
-                    key=option_key,
+                mask_image = self._mask_image_for_csv(csv_path, crop_image, source_image, image_num)
+            if crop_image is None:
+                crop_image = self._pass_image_for_mask(mask_image)
+            date_name = self._date_label_for_path(root_path, analysis_path)
+            work_label = self._work_folder_label(root_path, analysis_path, date_name)
+            analysis_id = self._clean_text(row_dict.get("AnalysisID")) or self._analysis_id_for_path(analysis_path)
+            display_path = self._display_path(root_path, crop_image or source_image or mask_image or csv_path)
+            rows.append(
+                _ResultRow(
+                    key=f"{csv_path}|{index}",
+                    date_name=date_name,
+                    work_label=work_label,
+                    display_path=display_path,
                     analysis_id=analysis_id,
                     analysis_path=analysis_path,
                     csv_path=csv_path,
                     cell=cell,
-                    label=f"{analysis_id} Cell #{cell}",
-                    result_summary=self._cell_result_summary(frame, cell),
+                    face=face,
+                    image_num=image_num,
+                    li_salt_percent=li_percent,
+                    nonactive_percent=nonactive_percent,
+                    pass_image=crop_image,
+                    mask_image=mask_image,
+                    row=row_dict,
                 )
-                options_by_key[option_key] = option
-
-            point = _SeriesPoint(
-                option_key=option_key,
-                label=option.label,
-                face=face,
-                image_num=image_num,
-                percent=percent,
-                is_issue=self._coerce_bool(row_dict.get("isIssue", False)),
-                row=row_dict,
-                pass_image=pass_image if pass_image and pass_image.exists() else pass_image,
-                mask_image=mask_image if mask_image and mask_image.exists() else None,
             )
-            points_by_option.setdefault(option_key, []).append(point)
-            display_path = self._display_path_for_result(csv_path, pass_image, mask_image)
-            modified_ts = self._modified_ts(csv_path, pass_image, mask_image)
-            result_row = _ResultRow(
-                key=self._result_identity(csv_path, pass_image, mask_image, row_dict, cell, face, image_num),
-                option_key=option_key,
-                option=option,
-                point=point,
-                display_path=display_path,
-                face=face,
-                li_salt_percent=percent,
-                modified_text=self._format_modified(modified_ts),
-                modified_ts=modified_ts,
-                csv_display=self._relative_path_label(csv_path),
-            )
-            rows.append(result_row)
         return rows
 
-    def _is_analysis_folder(self, folder_name: str) -> bool:
-        return bool(self._analysis_id_re.match(folder_name)) or is_test_analysis_id(folder_name)
+    def _row_from_mask(self, root_path: Path, mask_image: Path) -> _ResultRow | None:
+        li_percent, nonactive_percent = self._percentages_from_mask_image(mask_image)
+        pass_image = self._pass_image_for_mask(mask_image)
+        analysis_path = self._analysis_path_for_mask_folder(mask_image.parent)
+        date_name = self._date_label_for_path(root_path, analysis_path)
+        work_label = self._work_folder_label(root_path, analysis_path, date_name)
+        image_num = self._image_num_from_name(mask_image.name)
+        face = self._face_from_path(mask_image)
+        analysis_id = self._analysis_id_for_path(analysis_path)
+        row = {
+            "AnalysisID": analysis_id,
+            "Cell": 1,
+            "Face": face,
+            "ImageNum": image_num,
+            "nonactive_ratio": nonactive_percent / 100.0,
+            "li_salt_ratio": li_percent / 100.0,
+        }
+        return _ResultRow(
+            key=str(mask_image),
+            date_name=date_name,
+            work_label=work_label,
+            display_path=self._display_path(root_path, pass_image or mask_image),
+            analysis_id=analysis_id,
+            analysis_path=analysis_path,
+            csv_path=mask_image.parent / "_derived_from_masks.csv",
+            cell=1,
+            face=face,
+            image_num=image_num,
+            li_salt_percent=li_percent,
+            nonactive_percent=nonactive_percent,
+            pass_image=pass_image,
+            mask_image=mask_image,
+            row=row,
+        )
+
+    def _iter_mask_folders(self, root_path: Path) -> list[Path]:
+        folders: list[Path] = []
+        for path in root_path.rglob("*"):
+            if path.is_dir() and self._is_mask_folder(path):
+                folders.append(path)
+        return sorted(folders, key=lambda path: str(path).lower())
 
     def _analysis_path_for_csv(self, csv_path: Path) -> Path:
-        parent = csv_path.parent
-        lower = parent.name.lower()
-        if lower.endswith("_mask") or lower.endswith("_masks"):
-            return parent.parent
-        return parent
+        if self._is_mask_folder(csv_path.parent):
+            return self._analysis_path_for_mask_folder(csv_path.parent)
+        return csv_path.parent
 
-    def _analysis_id_for_row(self, row: dict, analysis_path: Path) -> str:
-        for key in ("AnalysisID", "analysis_id", "analysisId"):
-            value = self._clean_text(row.get(key, ""))
-            if value:
-                return value
-        return analysis_path.name
+    def _is_mask_folder(self, path: Path) -> bool:
+        name = path.name.upper()
+        return name in {"_MASK", "_MASKS"} or name.endswith("_MASK") or name.endswith("_MASKS")
 
-    def _face_for_row(self, row: dict, csv_path: Path) -> str:
-        value = self._clean_text(row.get("Face", row.get("face", ""))).upper()
-        if value:
-            return value
-        return self._infer_face("", csv_path, None, None)
+    def _analysis_path_for_mask_folder(self, mask_folder: Path) -> Path:
+        name = mask_folder.name
+        upper = name.upper()
+        if upper in {"_MASK", "_MASKS"}:
+            return mask_folder.parent
+        for suffix in ("_MASKS", "_masks", "_MASK", "_mask"):
+            if name.endswith(suffix):
+                source = mask_folder.with_name(name[: -len(suffix)])
+                if source.exists():
+                    return source
+        return mask_folder.parent
 
-    def _infer_face(
-        self,
-        face: str,
-        csv_path: Path,
-        pass_image: Path | None,
-        mask_image: Path | None,
-    ) -> str:
-        candidates = [
-            face,
-            pass_image.parent.name if pass_image is not None else "",
-            mask_image.parent.name if mask_image is not None else "",
-            csv_path.parent.name,
-        ]
-        for candidate in candidates:
-            upper = str(candidate).upper()
-            if "FRONT" in upper:
-                return "FRONT"
-            if "BACK" in upper:
-                return "BACK"
-            if "TEST" in upper:
-                return "TEST"
-        return str(face or "UNKNOWN").upper()
+    def _date_label_for_path(self, root_path: Path, path: Path) -> str:
+        for candidate in [path, *path.parents]:
+            if candidate == root_path.parent:
+                break
+            if self._parse_date_folder(candidate.name) is not None:
+                return candidate.name
+        return "No date"
 
-    def _int_from_row(self, row: dict, *keys: str, default: int) -> int:
-        for key in keys:
-            value = row.get(key)
+    def _work_folder_label(self, root_path: Path, analysis_path: Path, date_name: str) -> str:
+        base = root_path / date_name if date_name != "No date" else root_path
+        try:
+            rel = analysis_path.relative_to(base)
+            return rel.as_posix() or analysis_path.name
+        except ValueError:
+            return analysis_path.name
+
+    def _analysis_id_for_path(self, analysis_path: Path) -> str:
+        for candidate in [analysis_path, *analysis_path.parents]:
+            if self._is_analysis_folder(candidate.name):
+                return candidate.name
+        return re.sub(r"[^A-Za-z0-9_]+", "_", analysis_path.name).strip("_") or "WORK"
+
+    def _display_path(self, root_path: Path, path: Path) -> str:
+        try:
+            return str(path.relative_to(root_path))
+        except ValueError:
+            return str(path)
+
+    def _li_salt_percent_from_row(self, row: dict, csv_path: Path) -> float | None:
+        if "li_salt_ratio" in row and not pd.isna(row["li_salt_ratio"]):
             try:
-                if value is not None and not pd.isna(value):
-                    return int(float(value))
+                return self._ratio_to_percent(float(row["li_salt_ratio"]))
             except (TypeError, ValueError):
-                continue
-        return default
-
-    def _li_salt_percent_from_row(self, row: dict, fallback: float | None) -> float | None:
-        for key in ("li_salt_ratio", "li_salt_percent", "LI_SALT %", "LI_SALT"):
-            value = row.get(key)
-            try:
-                if value is None or pd.isna(value):
-                    continue
-                number = float(value)
-            except (TypeError, ValueError):
-                continue
-            if key == "li_salt_ratio":
-                return self._ratio_to_percent(number)
-            return number
-        return fallback
-
-    def _percent_from_filename(self, path: Path) -> float | None:
-        match = re.search(r"_LI[-_]SALT_([-+]?[0-9]*\.?[0-9]+)%", path.name, re.IGNORECASE)
+                pass
+        match = re.search(r"LI[-_]SALT_([0-9.]+)%", csv_path.name, re.IGNORECASE)
         if not match:
             return None
         try:
@@ -679,99 +692,106 @@ class AnalysisTab(ttk.Frame):
         except ValueError:
             return None
 
-    def _path_from_row(self, row: dict, csv_path: Path, *keys: str) -> Path | None:
-        for key in keys:
-            text = self._clean_text(row.get(key, ""))
-            if not text:
-                continue
-            path = path_resolver.resolve_path(text)
-            if not path.is_absolute():
-                path = csv_path.parent / path
-            return path
-        return None
+    def _nonactive_percent_from_row(self, row: dict) -> float | None:
+        if "nonactive_ratio" not in row or pd.isna(row["nonactive_ratio"]):
+            return None
+        try:
+            return self._ratio_to_percent(float(row["nonactive_ratio"]))
+        except (TypeError, ValueError):
+            return None
 
-    def _pass_image_for_mask(self, mask_image: Path) -> Path | None:
-        stem = mask_image.stem
-        if stem.endswith("_mask"):
-            stem = stem[:-5]
-        parent_name = mask_image.parent.name
-        candidates = []
-        for suffix in ("_MASK", "_mask", "_MASKS", "_masks"):
-            if parent_name.endswith(suffix):
-                candidates.append(mask_image.parent.with_name(parent_name[: -len(suffix)] + "_PASS"))
-                candidates.append(mask_image.parent.with_name(parent_name[: -len(suffix)] + "_pass"))
-        candidates.append(mask_image.parent.with_name(mask_image.parent.name.replace("MASK", "PASS")))
-        for folder in candidates:
-            for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"):
-                path = folder / f"{stem}{ext}"
-                if path.exists():
-                    return path
-        return None
+    def _path_from_value(self, value) -> Path | None:
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).strip()
+        return Path(text) if text else None
 
-    def _display_path_for_result(
-        self,
-        csv_path: Path,
-        pass_image: Path | None,
-        mask_image: Path | None,
-    ) -> str:
-        if pass_image is not None:
-            return self._relative_path_label(pass_image)
-        if mask_image is not None:
-            return self._display_label_from_mask(mask_image)
-        if csv_path.parent.name.lower().endswith(("_mask", "_masks")):
-            return self._display_label_from_mask(csv_path)
-        return self._relative_path_label(csv_path)
+    def _int_value(self, value, default: int) -> int:
+        try:
+            if value is None or pd.isna(value):
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
 
-    def _display_label_from_mask(self, path: Path) -> str:
-        parent_name = path.parent.name
-        display_parent = path.parent
+    def _face_from_path(self, path: Path) -> str:
+        upper_parts = [part.upper() for part in path.parts]
+        for face in ("FRONT", "BACK", "TEST"):
+            if face in upper_parts or any(part.endswith(f"_{face}") or part.startswith(f"{face}_") for part in upper_parts):
+                return face
+        return "WORK"
+
+    def _image_num_from_name(self, filename: str) -> int:
+        match = re.search(r"(\d+)", filename)
+        return int(match.group(1)) if match else 1
+
+    def _mask_image_for_csv(self, csv_path: Path, crop_image: Path | None, source_image: Path | None, image_num: int) -> Path | None:
+        if crop_image is not None:
+            candidate = self._find_mask_image(crop_image, self._face_from_path(crop_image))
+            if candidate is not None:
+                return candidate
+        stem = (crop_image or source_image).stem if (crop_image or source_image) is not None else csv_path.stem.split("_LI")[0]
+        candidates = sorted(csv_path.parent.glob(f"{stem}*_mask.png"), key=lambda path: path.name.lower())
+        if candidates:
+            return candidates[0]
+        masks = sorted(csv_path.parent.glob("*_mask.png"), key=lambda path: path.name.lower())
+        index = max(0, image_num - 1)
+        return masks[index] if index < len(masks) else None
+
+    def _pass_image_for_mask(self, mask_image: Path | None) -> Path | None:
+        if mask_image is None:
+            return None
+        mask_folder = mask_image.parent
+        stem = mask_image.name[:-9] if mask_image.name.endswith("_mask.png") else mask_image.stem
+        pass_dirs = []
+        name = mask_folder.name
+        upper = name.upper()
+        if upper in {"_MASK", "_MASKS"}:
+            pass_dirs.append(mask_folder.with_name("_PASS"))
         for suffix in ("_MASKS", "_masks", "_MASK", "_mask"):
-            if parent_name.endswith(suffix):
-                display_parent = path.parent.with_name(parent_name[: -len(suffix)])
-                break
-        stem = path.stem
-        if stem.endswith("_mask"):
-            stem = stem[:-5]
-        stem = re.sub(r"_LI[-_]SALT(?:_[-+]?[0-9]*\.?[0-9]+%)?$", "", stem, flags=re.IGNORECASE)
-        return self._relative_path_label(display_parent / f"{stem}.png")
+            if name.endswith(suffix):
+                pass_dirs.append(mask_folder.with_name(f"{name[: -len(suffix)]}_PASS"))
+                pass_dirs.append(mask_folder.with_name(f"{name[: -len(suffix)]}_pass"))
+        for pass_dir in pass_dirs:
+            for ext in _IMAGE_EXTENSIONS:
+                candidate = pass_dir / f"{stem}{ext}"
+                if candidate.exists():
+                    return candidate
+        return None
 
-    def _modified_ts(
-        self,
-        csv_path: Path,
-        pass_image: Path | None,
-        mask_image: Path | None,
-    ) -> float:
-        paths = [path for path in (csv_path, mask_image, pass_image) if path is not None]
-        values = []
-        for path in paths:
-            try:
-                values.append(path.stat().st_mtime)
-            except OSError:
-                continue
-        return max(values) if values else 0.0
+    def _percentages_from_mask_image(self, mask_image: Path) -> tuple[float, float]:
+        image = cv2.imread(str(mask_image), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            return 0.0, 0.0
+        channels = image[:, :, :3]
+        valid = image[:, :, 3] > 0 if image.ndim == 3 and image.shape[2] >= 4 else np.ones(image.shape[:2], dtype=bool)
+        total = int(valid.sum())
+        if total <= 0:
+            return 0.0, 0.0
+        li_mask = np.all(channels == _MASK_COLOR_LI_SALT, axis=2) & valid
+        nonactive_mask = np.all(channels == _MASK_COLOR_NONACTIVE, axis=2) & valid
+        return float(li_mask.sum()) / total * 100.0, float(nonactive_mask.sum()) / total * 100.0
 
-    def _format_modified(self, timestamp: float) -> str:
-        if timestamp <= 0:
-            return "-"
-        return pd.Timestamp.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+    @staticmethod
+    def _is_generated_li_salt_csv(path: Path) -> bool:
+        name = path.name.upper()
+        return path.suffix.lower() == ".csv" and ("LI-SALT" in name or "LI_SALT" in name)
 
-    def _result_identity(
-        self,
-        csv_path: Path,
-        pass_image: Path | None,
-        mask_image: Path | None,
-        row: dict,
-        cell: int,
-        face: str,
-        image_num: int,
-    ) -> str:
-        for path in (mask_image, pass_image):
-            if path is not None:
-                return str(path).lower()
-        source = self._clean_text(row.get("source_image", row.get("image_name", "")))
-        if source:
-            return source.lower()
-        return f"{csv_path}|{cell}|{face}|{image_num}".lower()
+    @staticmethod
+    def _format_li_salt_percent(value: float) -> str:
+        if value == 0:
+            return "0.00"
+        if abs(value) < 0.01:
+            return f"{value:.4f}"
+        return f"{value:.2f}"
+
+    def _row_result_summary(self, row: _ResultRow) -> str:
+        if row.nonactive_percent is None:
+            return f"Li {row.li_salt_percent:.2f}% / Nonactive -"
+        return f"Li {row.li_salt_percent:.2f}% / Nonactive {row.nonactive_percent:.2f}%"
+
+    def _is_analysis_folder(self, folder_name: str) -> bool:
+        return bool(self._analysis_id_re.match(folder_name)) or is_test_analysis_id(folder_name)
 
     def _cell_result_summary(self, frame: pd.DataFrame, cell: int) -> str:
         required = {"Cell", "Face", "ImageNum", "li_salt_ratio", "nonactive_ratio"}
@@ -831,33 +851,84 @@ class AnalysisTab(ttk.Frame):
         item_id = self._result_tree.identify_row(event.y)
         if not item_id:
             return "break"
-        if item_id not in self._row_by_item:
-            self._result_tree.item(item_id, open=not bool(self._result_tree.item(item_id, "open")))
+        if item_id in self._row_by_item:
+            self._select_result_item(item_id)
             return "break"
-        self._select_result_item(item_id)
-        return "break"
+        if item_id in self._option_rows_by_item:
+            self._select_result_option(item_id)
+            try:
+                self._result_tree.item(item_id, open=not bool(self._result_tree.item(item_id, "open")))
+            except tk.TclError:
+                pass
+            return "break"
+        option = self._option_by_item.get(item_id)
+        if option is None:
+            return "break"
 
-    def _select_result_item(self, item_id: str) -> None:
-        row = self._row_by_item.get(item_id)
-        if row is None:
-            return
-        option = row.option
-        if option.key not in self._selected_options:
+        if option.key in self._selected_options:
+            self._remove_option_series(option.key)
+        else:
             self._selected_options[option.key] = option
-            self._add_option_points(option)
-        self._active_result_item = item_id
-        self._heatmap_option_key = option.key
-        if row.face in _FACE_MODES:
-            self._face_mode_var.set(row.face)
+            self._heatmap_option_key = option.key
+            self._add_option_series(option)
+
         self._sync_result_tree_styles()
         self._redraw_graph()
         self._redraw_heatmap()
-        self._show_point_images(row.point)
+        return "break"
 
     def _sync_result_tree_styles(self) -> None:
-        for item_id, row in self._row_by_item.items():
+        for item_id, option in self._option_by_item.items():
+            tags = ("selected",) if option.key in self._selected_options else ()
+            self._result_tree.item(item_id, tags=tags)
+        for item_id in self._row_by_item:
             tags = ("selected",) if item_id == self._active_result_item else ()
             self._result_tree.item(item_id, tags=tags)
+
+    def _sort_results(self, column: str) -> None:
+        rows = list(self._row_by_item.values())
+        if column == "li_salt":
+            rows.sort(key=lambda row: row.li_salt_percent)
+        elif column == "face":
+            rows.sort(key=lambda row: (row.face, row.date_name, row.work_label, row.image_num))
+        else:
+            rows.sort(key=lambda row: (row.date_name, row.work_label, row.display_path))
+        self._set_result_rows(rows)
+
+    def _select_result_item(self, item_id: str) -> None:
+        row = self._row_by_item[item_id]
+        self._active_result_item = item_id
+        self._selected_options.clear()
+        self._all_series_points = [self._series_point_from_row(row)]
+        self._shown_point = self._all_series_points[0]
+        self._heatmap_option_key = row.key
+        self._sync_result_tree_styles()
+        self._redraw_graph()
+        self._redraw_heatmap()
+
+    def _select_result_option(self, item_id: str) -> None:
+        rows = self._option_rows_by_item[item_id]
+        self._active_result_item = item_id
+        self._selected_options.clear()
+        self._all_series_points = [self._series_point_from_row(row) for row in rows]
+        self._shown_point = self._all_series_points[0] if self._all_series_points else None
+        self._heatmap_option_key = rows[0].key if rows else None
+        self._sync_result_tree_styles()
+        self._redraw_graph()
+        self._redraw_heatmap()
+
+    def _series_point_from_row(self, row: _ResultRow) -> _SeriesPoint:
+        return _SeriesPoint(
+            option_key=row.key,
+            label=row.work_label,
+            face=row.face,
+            image_num=row.image_num,
+            percent=row.li_salt_percent,
+            is_issue=self._coerce_bool(row.row.get("isIssue", False)),
+            row=dict(row.row),
+            pass_image=row.pass_image,
+            mask_image=row.mask_image if row.mask_image and row.mask_image.exists() else None,
+        )
 
     def _remove_option_series(self, option_key: str) -> None:
         self._selected_options.pop(option_key, None)
@@ -909,14 +980,6 @@ class AnalysisTab(ttk.Frame):
                 )
             )
 
-    def _add_option_points(self, option: _ResultOption) -> None:
-        points = self._points_by_option.get(option.key)
-        if points:
-            existing = {id(point) for point in self._all_series_points}
-            self._all_series_points.extend(point for point in points if id(point) not in existing)
-            return
-        self._add_option_series(option)
-
     def _coerce_bool(self, value) -> bool:
         if isinstance(value, bool):
             return value
@@ -953,12 +1016,7 @@ class AnalysisTab(ttk.Frame):
             cell_path = analysis_path / f"Cell #{cell}"
             if not cell_path.is_dir():
                 cell_path = analysis_path
-            pass_path = self._first_existing_dir(
-                cell_path / f"{face}_pass",
-                cell_path / f"{face}_PASS",
-                cell_path / f"{face.upper()}_pass",
-                cell_path / f"{face.upper()}_PASS",
-            )
+            pass_path = cell_path / f"{face}_pass"
         if not pass_path.is_dir():
             return None
         images = sorted(
@@ -984,28 +1042,14 @@ class AnalysisTab(ttk.Frame):
             mask_path = get_test_mask_folder_for_pass(pass_image.parent) / mask_name
             if mask_path.exists():
                 return mask_path
-        for folder in (
-            pass_image.parent.with_name(f"{face}_mask"),
-            pass_image.parent.with_name(f"{face}_MASK"),
-            pass_image.parent.with_name(f"{face.upper()}_mask"),
-            pass_image.parent.with_name(f"{face.upper()}_MASK"),
-            pass_image.parent.with_name(pass_image.parent.name.replace("_PASS", "_MASK")),
-            pass_image.parent.with_name(pass_image.parent.name.replace("_pass", "_mask")),
-        ):
-            mask_path = folder / mask_name
-            if mask_path.exists():
-                return mask_path
+        mask_path = pass_image.parent.with_name(f"{face}_mask") / mask_name
+        if mask_path.exists():
+            return mask_path
 
         legacy_path = pass_image.with_name(mask_name)
         if legacy_path.exists():
             return legacy_path
         return None
-
-    def _first_existing_dir(self, *paths: Path) -> Path:
-        for path in paths:
-            if path.is_dir():
-                return path
-        return paths[0]
 
     def _visible_points(self) -> list[_SeriesPoint]:
         mode = self._face_mode_var.get()
@@ -1066,11 +1110,110 @@ class AnalysisTab(ttk.Frame):
         self._overlap_points.clear()
         self._shown_point = None
         self._heatmap_option_key = None
-        self._active_result_item = None
         self._clear_images()
         self._sync_result_tree_styles()
         self._redraw_graph()
         self._redraw_heatmap()
+
+    def _export_data(self) -> None:
+        options = list(self._selected_options.values()) or list(self._result_options)
+        if not options:
+            messagebox.showinfo("Analysis Export", "No analysis result data to export.")
+            return
+
+        default_dir = self._default_export_dir()
+        default_dir.mkdir(parents=True, exist_ok=True)
+        default_name = f"analysis_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        file_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export analysis data",
+            initialdir=str(default_dir),
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=(
+                ("CSV", "*.csv"),
+                ("Excel workbook", "*.xlsx"),
+            ),
+        )
+        if not file_path:
+            return
+
+        try:
+            frame = self._export_frame(options)
+            target = Path(file_path)
+            if target.suffix.lower() == ".xlsx":
+                frame.to_excel(target, index=False)
+            else:
+                frame.to_csv(target, index=False, float_format="%.4f")
+        except ImportError as exc:
+            messagebox.showerror(
+                "Analysis Export",
+                f"Excel export requires the openpyxl package:\n{exc}",
+            )
+            return
+        except Exception as exc:
+            logger.exception("Analysis export failed")
+            messagebox.showerror("Analysis Export", f"Failed to export data:\n{exc}")
+            return
+
+        self._status_label.config(text=f"Exported {len(frame)} row(s)")
+
+    def _export_frame(self, options: list[_ResultOption]) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        for option in options:
+            frame = pd.read_csv(option.csv_path)
+            if "Cell" in frame.columns:
+                numeric_cells = pd.to_numeric(frame["Cell"], errors="coerce")
+                frame = frame[numeric_cells == option.cell].copy()
+            if frame.empty:
+                continue
+            frame.insert(0, "date_name", option.date_name)
+            frame.insert(1, "analysis_id_folder", option.analysis_id)
+            frame.insert(2, "result_csv", str(option.csv_path))
+            frames.append(frame)
+        if not frames:
+            raise RuntimeError("No rows matched the selected result(s).")
+        return pd.concat(frames, ignore_index=True)
+
+    def _capture_screen(self) -> None:
+        if ImageGrab is None:
+            messagebox.showerror(
+                "Analysis Capture",
+                "Screen capture requires the Pillow package.",
+            )
+            return
+
+        default_dir = self._default_export_dir()
+        default_dir.mkdir(parents=True, exist_ok=True)
+        default_name = f"analysis_capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        file_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Capture analysis screen",
+            initialdir=str(default_dir),
+            initialfile=default_name,
+            defaultextension=".png",
+            filetypes=(("PNG image", "*.png"),),
+        )
+        if not file_path:
+            return
+
+        try:
+            self.update_idletasks()
+            x0 = self.winfo_rootx()
+            y0 = self.winfo_rooty()
+            x1 = x0 + self.winfo_width()
+            y1 = y0 + self.winfo_height()
+            image = ImageGrab.grab(bbox=(x0, y0, x1, y1))
+            image.save(file_path)
+        except Exception as exc:
+            logger.exception("Analysis screen capture failed")
+            messagebox.showerror("Analysis Capture", f"Failed to capture screen:\n{exc}")
+            return
+
+        self._status_label.config(text=f"Captured {Path(file_path).name}")
+
+    def _default_export_dir(self) -> Path:
+        return self._root_path / ".qcml" / "exports"
 
     def _redraw_graph(self) -> None:
         self._graph.delete("all")
@@ -1099,7 +1242,7 @@ class AnalysisTab(ttk.Frame):
             self._graph.create_text(
                 width / 2,
                 height / 2,
-                text="Click an ML result on the left, or change the face view mode.",
+                text="Click a cell result on the left, or change the face view mode.",
                 fill=_C_MUTED,
             )
             return
@@ -1178,7 +1321,7 @@ class AnalysisTab(ttk.Frame):
                 )
                 self._canvas_points.append((x, y, point))
 
-            label = self._selected_options[option_key].label
+            label = self._selected_options[option_key].label if option_key in self._selected_options else points[0].label
             legend_text = f"{label} {face}"
             if dash:
                 self._graph.create_line(
@@ -1289,7 +1432,7 @@ class AnalysisTab(ttk.Frame):
         option = self._selected_options.get(self._heatmap_option_key or "")
         if option is None:
             self._heatmap_label.config(
-                text="Click an ML result on the left to build a heatmap.",
+                text="Click a cell result on the left to build a heatmap.",
                 foreground=_C_MUTED,
             )
             self._heatmap_canvas.create_text(
@@ -1551,7 +1694,7 @@ class AnalysisTab(ttk.Frame):
         self._overlap_combo.grid_remove()
         self._overlap_combo["values"] = ()
         self._overlap_var.set("")
-        self._selection_label.config(text="Click an ML result to inspect images.")
+        self._selection_label.config(text="Click a graph point to inspect images.")
         self._crop_canvas.delete("all")
         self._mask_canvas.delete("all")
         self._photo_refs.clear()

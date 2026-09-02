@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 
 from modules.qc.crop_engine import CropEngine, CropResult
-from modules.qc.folder_qc import FolderQC, FolderQCResult
+from modules.qc.folder_qc import CellResult, FolderQC, FolderQCResult
 from modules.qc.retake_manager import RetakeItem, RetakeManager
 from modules.utils.analysis_id import (
     build_test_output_name,
@@ -44,7 +44,7 @@ class QCPipelineResult:
 
     @property
     def crop_done(self) -> bool:
-        return bool(self.crop_batches) or self.folder_result.status == "PASS"
+        return bool(self.crop_batches) or self.folder_result.status in {"PASS", "WARNING"}
 
 
 class QCPipeline:
@@ -105,7 +105,7 @@ class QCPipeline:
             customer_code=customer_code,
             folder_result=folder_result,
         )
-        if folder_result.status != "PASS" and not force_folder_qc:
+        if folder_result.status == "FAIL" and not force_folder_qc:
             return pipeline_result
 
         if is_test_analysis_id(analysis_id):
@@ -116,7 +116,7 @@ class QCPipeline:
             )
             return pipeline_result
 
-        if folder_result.status == "PASS":
+        if folder_result.status in {"PASS", "WARNING"}:
             source_folders = [
                 (face_name, folder_path)
                 for cell in folder_result.cells
@@ -135,7 +135,7 @@ class QCPipeline:
             ]
 
         for face_name, folder_path in source_folders:
-            output_folder = folder_path.parent / f"{face_name}_pass"
+            output_folder = self._pass_output_folder(face_name, folder_path)
             if clear_pass_outputs:
                 self.clear_pass_outputs(output_folder)
             crop_results = self._crop_engine.process_folder(
@@ -155,6 +155,125 @@ class QCPipeline:
                 self._failed_items_for_batch(
                     batch,
                     skip_size_validation=False,
+                )
+            )
+
+        return pipeline_result
+
+    def run_crop_only(
+        self,
+        *,
+        root_path: str | Path,
+        date_name: str,
+        analysis_id: str,
+        analysis_path: str | Path | None = None,
+        clear_pass_outputs: bool = False,
+    ) -> QCPipelineResult:
+        resolved_analysis_path = (
+            Path(analysis_path) if analysis_path is not None else Path(root_path) / date_name / analysis_id
+        )
+        customer_code = self.customer_code_for_analysis(analysis_id)
+        folder_result = FolderQCResult(
+            status="PASS",
+            analysis_id=analysis_id,
+            customer=customer_code,
+        )
+        pipeline_result = QCPipelineResult(
+            analysis_id=analysis_id,
+            analysis_path=resolved_analysis_path,
+            date_name=date_name,
+            customer_code=customer_code,
+            folder_result=folder_result,
+        )
+
+        if is_test_analysis_id(analysis_id):
+            ensure_test_output_folders(resolved_analysis_path)
+            for source_folder in [
+                source_path
+                for _cell, source_path in find_test_source_folders(resolved_analysis_path)
+            ]:
+                output_folder, _mask_folder = get_test_output_folders(
+                    resolved_analysis_path,
+                    source_folder,
+                )
+                output_folder.mkdir(parents=True, exist_ok=True)
+                if clear_pass_outputs:
+                    self.clear_pass_outputs(output_folder)
+                crop_results: list[CropResult] = []
+                output_paths: dict[Path, Path] = {}
+                for image_path in find_test_images(source_folder, _IMAGE_EXTENSIONS):
+                    output_path = output_folder / build_test_output_name(source_folder, image_path)
+                    output_paths[image_path] = output_path
+                    crop_results.append(
+                        self._crop_engine.process_image(
+                            image_path=image_path,
+                            customer_code=customer_code,
+                            output_path=output_path,
+                            skip_size_validation=True,
+                            image_postprocess=None,
+                            force_save_failed=True,
+                        )
+                    )
+                folder_result.cells.append(
+                    CellResult(
+                        cell_name=source_folder.name if source_folder != resolved_analysis_path else "single",
+                        front_path=source_folder,
+                        back_path=None,
+                        front_count=len(crop_results),
+                        back_count=0,
+                        status="PASS",
+                    )
+                )
+                batch = QCCropBatch(
+                    folder_path=source_folder,
+                    customer_code=customer_code,
+                    output_folder=output_folder,
+                    crop_results=crop_results,
+                    output_paths=output_paths,
+                    skip_size_validation_for_all=True,
+                )
+                pipeline_result.crop_batches.append(batch)
+                pipeline_result.failed_items.extend(
+                    self._failed_items_for_batch(
+                        batch,
+                        skip_size_validation=True,
+                    )
+                )
+            return pipeline_result
+
+        for _cell_name, face_name, folder_path in self._forced_source_folders(
+            resolved_analysis_path
+        ):
+            output_folder = self._pass_output_folder(face_name, folder_path)
+            if clear_pass_outputs:
+                self.clear_pass_outputs(output_folder)
+            crop_results = self._crop_folder_without_qc_checks(
+                folder_path=folder_path,
+                customer_code=customer_code,
+                output_folder=output_folder,
+            )
+            folder_result.cells.append(
+                CellResult(
+                    cell_name=_cell_name,
+                    front_path=folder_path if face_name == "FRONT" else None,
+                    back_path=folder_path if face_name == "BACK" else None,
+                    front_count=len(crop_results) if face_name == "FRONT" else 0,
+                    back_count=len(crop_results) if face_name == "BACK" else 0,
+                    status="PASS",
+                )
+            )
+            batch = QCCropBatch(
+                folder_path=folder_path,
+                customer_code=customer_code,
+                output_folder=output_folder,
+                crop_results=crop_results,
+                skip_size_validation_for_all=True,
+            )
+            pipeline_result.crop_batches.append(batch)
+            pipeline_result.failed_items.extend(
+                self._failed_items_for_batch(
+                    batch,
+                    skip_size_validation=True,
                 )
             )
 
@@ -212,7 +331,7 @@ class QCPipeline:
     ) -> None:
         folder_result = pipeline_result.folder_result
         analysis_path = pipeline_result.analysis_path
-        if folder_result.status == "PASS":
+        if folder_result.status in {"PASS", "WARNING"}:
             source_folders = [
                 cell.front_path
                 for cell in folder_result.cells
@@ -299,6 +418,31 @@ class QCPipeline:
             )
         return failures
 
+    def _crop_folder_without_qc_checks(
+        self,
+        *,
+        folder_path: Path,
+        customer_code: str,
+        output_folder: Path,
+    ) -> list[CropResult]:
+        image_paths = sorted(
+            path
+            for path in folder_path.iterdir()
+            if path.is_file() and path.suffix.lower() in _IMAGE_EXTENSIONS
+        )
+        output_folder.mkdir(parents=True, exist_ok=True)
+        return [
+            self._crop_engine.process_image(
+                image_path=image_path,
+                customer_code=customer_code,
+                output_path=output_folder / f"{image_path.stem}.png",
+                skip_size_validation=True,
+                image_postprocess=None,
+                force_save_failed=True,
+            )
+            for image_path in image_paths
+        ]
+
     def _forced_cell_paths(self, analysis_path: Path) -> list[tuple[str, Path]]:
         if not analysis_path.is_dir():
             return []
@@ -327,7 +471,18 @@ class QCPipeline:
                 folder_path = face_paths.get(face_name)
                 if folder_path is not None:
                     sources.append((cell_name, face_name, folder_path))
+            if not face_paths and any(
+                path.is_file() and path.suffix.lower() in _IMAGE_EXTENSIONS
+                for path in cell_path.iterdir()
+            ):
+                sources.append((cell_name, "FRONT", cell_path))
         return sources
+
+    @staticmethod
+    def _pass_output_folder(face_name: str, source_path: Path) -> Path:
+        if source_path.name.upper() == face_name.upper():
+            return source_path.parent / f"{face_name}_pass"
+        return source_path / f"{face_name}_pass"
 
     @property
     def _crop_engine(self) -> CropEngine:

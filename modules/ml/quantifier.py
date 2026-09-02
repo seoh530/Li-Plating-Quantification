@@ -46,9 +46,9 @@ class Quantifier:
         nonactive_count = int(counts[LABEL_INACTIVE])
         li_salt_count = int(counts[LABEL_LI_SALT])
 
-        background_ratio = round(background_count / total_pixel, 2)
-        nonactive_ratio = round(nonactive_count / total_pixel, 2)
-        li_salt_ratio = round(li_salt_count / total_pixel, 2)
+        background_ratio = background_count / total_pixel
+        nonactive_ratio = nonactive_count / total_pixel
+        li_salt_ratio = li_salt_count / total_pixel
 
         return {
             "AnalysisID": analysis_id,

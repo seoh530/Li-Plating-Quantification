@@ -27,6 +27,7 @@ class InferenceTask:
     face: str
     image_num: int
     image_path: Path
+    customer: str | None = None
 
 
 @dataclass
@@ -339,7 +340,7 @@ class InferencePipeline:
             "face": task.face,
             "image_num": task.image_num,
             "image_name": task.image_path.name,
-            "customer": self._customer_for_analysis(task.analysis_id),
+            "customer": task.customer or self._customer_for_analysis(task.analysis_id),
             "model_version": self._inference.model_version,
             "total_pixel": int(result_row["total_pixel"]),
             "background_ratio": float(result_row["background_ratio"]),
