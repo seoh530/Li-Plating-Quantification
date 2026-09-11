@@ -1,6 +1,8 @@
 import logging
+import queue
 import re
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 
@@ -103,11 +105,21 @@ class _ResultRow:
     cell: int
     face: str
     image_num: int
-    li_salt_percent: float
+    li_salt_percent: float | None
     nonactive_percent: float | None
     pass_image: Path | None
     mask_image: Path | None
     row: dict
+
+    @property
+    def bundle_label(self) -> str:
+        if self.csv_path.name == "_derived_from_masks.csv":
+            return self.work_label
+        folder_name = re.sub(r"[^A-Za-z0-9_]+", "_", self.analysis_path.name).strip("_") or "WORK"
+        stem = self.csv_path.stem.upper()
+        if stem == f"{folder_name}_RESULT".upper() or stem.startswith(f"{folder_name}_LI-SALT".upper()):
+            return self.work_label
+        return f"{self.work_label} / {self.csv_path.name}"
 
 
 class AnalysisTab(ttk.Frame):
@@ -123,6 +135,7 @@ class AnalysisTab(ttk.Frame):
         self._option_by_item: dict[str, _ResultOption] = {}
         self._option_rows_by_item: dict[str, list[_ResultRow]] = {}
         self._row_by_item: dict[str, _ResultRow] = {}
+        self._current_result_rows: list[_ResultRow] = []
         self._selected_options: dict[str, _ResultOption] = {}
         self._all_series_points: list[_SeriesPoint] = []
         self._canvas_points: list[tuple[float, float, _SeriesPoint]] = []
@@ -135,9 +148,15 @@ class AnalysisTab(ttk.Frame):
             tuple[np.ndarray, np.ndarray, int],
         ] = {}
         self._photo_refs: list[tk.PhotoImage] = []
+        self._queue: queue.Queue = queue.Queue()
+        self._date_scan_generation = 0
+        self._result_scan_generation = 0
+        self._result_scan_worker: threading.Thread | None = None
 
         self._build_ui()
-        self._load_dates()
+        self._date_combo.config(state=tk.DISABLED)
+        self._status_label.config(text="Click Load Path to load analysis results.")
+        self._poll_queue()
 
     def _load_config(self) -> None:
         with open(self._config_path, encoding="utf-8") as fh:
@@ -182,7 +201,7 @@ class AnalysisTab(ttk.Frame):
         self._face_mode_combo.grid(row=0, column=3, sticky=tk.W)
         self._face_mode_combo.bind("<<ComboboxSelected>>", self._on_face_mode_change)
 
-        ttk.Button(header, text="Refresh", command=self._refresh).grid(
+        ttk.Button(header, text="Load Path", command=self._refresh).grid(
             row=0, column=4, sticky=tk.W, padx=(8, 0)
         )
         ttk.Button(header, text="Clear graph", command=self._clear_graph).grid(
@@ -298,23 +317,63 @@ class AnalysisTab(ttk.Frame):
         self._mask_canvas = tk.Canvas(images, bg="#f5f5f5", height=230, highlightthickness=1)
         self._mask_canvas.grid(row=1, column=1, sticky=tk.EW, padx=(5, 0))
 
-    def reload_settings(self) -> None:
+    def reload_config(self) -> None:
         self._load_config()
-        self._load_dates()
+        self._root_path_var.set(str(self._root_path))
+        self._date_combo.config(state=tk.DISABLED)
+        self._reset_results("Settings loaded. Click Load Path to load analysis results.")
 
-    def _load_dates(self) -> None:
-        self._date_values = self._list_date_folders()
+    def reload_settings(self) -> None:
+        self.reload_config()
+
+    def _load_dates(self, *, load_results: bool = True) -> None:
+        previous = self._date_var.get().strip()
+        self._date_values = self._list_date_folders(self._root_path)
         self._date_combo["values"] = self._date_values
-        selected = self._pick_default_date(self._date_values)
+        selected = previous if previous in self._date_values else self._pick_default_date(self._date_values)
         self._date_var.set(selected)
-        self._load_results()
+        if load_results:
+            self._load_results()
+
+    def _start_load_dates(self, *, load_results: bool = False) -> None:
+        self._date_scan_generation += 1
+        generation = self._date_scan_generation
+        previous = self._date_var.get().strip()
+        root_path = self._root_path
+        self._date_combo.config(state=tk.DISABLED)
+        self._status_label.config(text="Loading dates...")
+        threading.Thread(
+            target=self._load_dates_worker,
+            args=(generation, root_path, previous, load_results),
+            daemon=True,
+        ).start()
+
+    def _load_dates_worker(self, generation: int, root_path: Path, previous: str, load_results: bool) -> None:
+        try:
+            date_values = self._list_date_folders(root_path)
+            self._queue.put(("dates_ready", (generation, previous, date_values, load_results)))
+        except Exception as exc:
+            logger.exception("Failed to load date folders from %s", root_path)
+            self._queue.put(("dates_error", (generation, str(exc))))
+
+    def _apply_loaded_dates(self, previous: str, date_values: list[str], *, load_results: bool) -> None:
+        self._date_values = list(date_values)
+        self._date_combo["values"] = self._date_values
+        selected = previous if previous in self._date_values else self._pick_default_date(self._date_values)
+        self._date_var.set(selected)
+        self._date_combo.config(state="readonly" if self._date_values else tk.DISABLED)
+        if load_results:
+            self._start_load_results()
+        else:
+            self._status_label.config(text="Select a date or click Refresh to load results.")
 
     def _refresh(self) -> None:
         self._load_config()
-        self._load_dates()
+        self._root_path_var.set(str(self._root_path))
+        self._start_load_dates(load_results=True)
 
     def _on_date_change(self, _event=None) -> None:
-        self._load_results()
+        self._reset_results("Date selected. Click Load Path to load analysis results.")
 
     def _on_face_mode_change(self, _event=None) -> None:
         self._clear_images()
@@ -332,11 +391,12 @@ class AnalysisTab(ttk.Frame):
         except tk.TclError:
             return False
 
-    def _list_date_folders(self) -> list[str]:
-        if not self._root_path.exists():
+    def _list_date_folders(self, root_path: Path | None = None) -> list[str]:
+        root_path = root_path or self._root_path
+        if not root_path.exists():
             return []
         dated: list[tuple[datetime, str]] = []
-        for path in self._root_path.iterdir():
+        for path in root_path.iterdir():
             if not path.is_dir():
                 continue
             parsed = self._parse_date_folder(path.name)
@@ -368,50 +428,101 @@ class AnalysisTab(ttk.Frame):
         raw_path = self._root_path_var.get().strip()
         if raw_path:
             self._root_path = Path(raw_path)
-        self._date_values = self._list_date_folders()
-        self._date_combo["values"] = self._date_values
-        if self._date_values and self._date_var.get() not in self._date_values:
-            self._date_var.set(self._pick_default_date(self._date_values))
-        rows = self._discover_result_rows(self._root_path)
-        self._set_result_rows(rows)
-        self._status_label.config(text=f"Loaded {len(rows)} result row(s) from {self._root_path}")
+        self._load_dates(load_results=False)
+        self._load_results()
 
     def _load_results(self) -> None:
-        if hasattr(self, "_root_path_var"):
-            self._load_root_path()
+        scan_path = self._selected_scan_path()
+        if scan_path is None:
+            self._reset_results("No date selected")
             return
+        rows = self._discover_result_rows(scan_path)
+        self._set_result_rows(rows)
+        self._status_label.config(text=f"Loaded {len(rows)} result row(s) from {scan_path}")
+
+    def _start_load_results(self) -> None:
+        scan_path = self._selected_scan_path()
+        self._result_scan_generation += 1
+        generation = self._result_scan_generation
+        if scan_path is None:
+            self._reset_results("No date selected")
+            return
+        self._reset_results(f"Loading results from {scan_path}...")
+        self._result_scan_worker = threading.Thread(
+            target=self._load_results_worker,
+            args=(generation, scan_path),
+            daemon=True,
+        )
+        self._result_scan_worker.start()
+
+    def _load_results_worker(self, generation: int, scan_path: Path) -> None:
+        try:
+            rows = self._discover_result_rows(scan_path)
+            self._queue.put(("results_ready", (generation, scan_path, rows)))
+        except Exception as exc:
+            logger.exception("Failed to load analysis results from %s", scan_path)
+            self._queue.put(("results_error", (generation, scan_path, str(exc))))
+
+    def _poll_queue(self) -> None:
+        try:
+            while True:
+                msg_type, payload = self._queue.get_nowait()
+                if msg_type == "dates_ready":
+                    generation, previous, date_values, load_results = payload
+                    if generation != self._date_scan_generation:
+                        continue
+                    self._apply_loaded_dates(previous, date_values, load_results=bool(load_results))
+                elif msg_type == "dates_error":
+                    generation, error = payload
+                    if generation != self._date_scan_generation:
+                        continue
+                    self._date_combo.config(state=tk.DISABLED)
+                    self._reset_results(f"Failed to load dates: {error}")
+                elif msg_type == "results_ready":
+                    generation, scan_path, rows = payload
+                    if generation != self._result_scan_generation:
+                        continue
+                    self._set_result_rows(rows)
+                    self._status_label.config(text=f"Loaded {len(rows)} result row(s) from {scan_path}")
+                elif msg_type == "results_error":
+                    generation, scan_path, error = payload
+                    if generation != self._result_scan_generation:
+                        continue
+                    self._reset_results(f"Failed to load results from {scan_path}: {error}")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def _reset_results(self, status: str = "") -> None:
         for item in self._result_tree.get_children():
             self._result_tree.delete(item)
         self._option_by_item.clear()
+        self._option_rows_by_item.clear()
+        self._row_by_item.clear()
+        self._current_result_rows.clear()
         self._result_options.clear()
         self._selected_options.clear()
         self._all_series_points.clear()
+        self._canvas_points.clear()
         self._overlap_points.clear()
         self._shown_point = None
+        self._active_result_item = None
         self._heatmap_option_key = None
         self._heatmap_counts_cache.clear()
         self._clear_images()
-
-        date_name = self._date_var.get().strip()
-        date_path = self._root_path / date_name if date_name else None
-        if date_path is None or not date_path.is_dir():
-            self._status_label.config(text="No date selected")
-            self._redraw_graph()
-            return
-
-        options = self._discover_result_options(date_name, date_path)
-        self._result_options = options
-        for option in options:
-            item_id = self._result_tree.insert(
-                "",
-                tk.END,
-                values=(option.analysis_id, f"#{option.cell}", option.result_summary),
-            )
-            self._option_by_item[item_id] = option
-
-        self._status_label.config(text=f"{len(options)} cell result(s)")
         self._redraw_graph()
         self._redraw_heatmap()
+        if status:
+            self._status_label.config(text=status)
+
+    def _selected_scan_path(self) -> Path | None:
+        date_name = self._date_var.get().strip()
+        if not date_name:
+            return self._root_path if not self._date_values and self._root_path.exists() else None
+        date_path = self._root_path / date_name
+        if not date_path.is_dir():
+            return None
+        return date_path
 
     def _discover_result_rows(self, root_path: Path) -> list[_ResultRow]:
         rows: list[_ResultRow] = []
@@ -421,8 +532,9 @@ class AnalysisTab(ttk.Frame):
         for csv_path in sorted(root_path.rglob("*.csv"), key=lambda path: str(path).lower()):
             if not self._is_generated_li_salt_csv(csv_path) and not csv_path.name.endswith("_result.csv"):
                 continue
-            rows.extend(self._rows_from_csv(root_path, csv_path))
-            for row in rows:
+            csv_rows = self._rows_from_csv(root_path, csv_path)
+            rows.extend(csv_rows)
+            for row in csv_rows:
                 if row.mask_image is not None:
                     seen_mask_keys.add((row.mask_image.parent, row.mask_image.stem))
         for mask_dir in self._iter_mask_folders(root_path):
@@ -435,6 +547,7 @@ class AnalysisTab(ttk.Frame):
         return rows
 
     def _set_result_rows(self, rows: list[_ResultRow]) -> None:
+        self._current_result_rows = list(rows)
         for item in self._result_tree.get_children():
             self._result_tree.delete(item)
         self._option_by_item.clear()
@@ -453,50 +566,63 @@ class AnalysisTab(ttk.Frame):
         grouped: dict[str, dict[str, list[_ResultRow]]] = {}
         row_order = {row.key: index for index, row in enumerate(rows)}
         for row in rows:
-            grouped.setdefault(row.date_name, {}).setdefault(row.work_label, []).append(row)
+            grouped.setdefault(row.date_name, {}).setdefault(row.bundle_label, []).append(row)
 
         for date_name in sorted(grouped.keys(), key=lambda name: min(row_order[row.key] for group in grouped[name].values() for row in group)):
             date_id = self._result_tree.insert("", tk.END, text=date_name, open=True, values=("", "", ""))
-            for work_label in sorted(grouped[date_name].keys(), key=lambda label: min(row_order[row.key] for row in grouped[date_name][label])):
-                work_rows = sorted(grouped[date_name][work_label], key=lambda row: row_order[row.key])
+            for bundle_label in sorted(grouped[date_name].keys(), key=lambda label: min(row_order[row.key] for row in grouped[date_name][label])):
+                work_rows = sorted(grouped[date_name][bundle_label], key=lambda row: row_order[row.key])
                 option = self._option_from_rows(work_rows)
-                option_id = self._result_tree.insert(date_id, tk.END, text=work_label, open=True, values=("", "", option.result_summary))
+                option_id = self._result_tree.insert(
+                    date_id,
+                    tk.END,
+                    text=bundle_label,
+                    open=True,
+                    values=(
+                        self._faces_summary(work_rows),
+                        self._format_li_salt_percent(self._average_li_salt(work_rows)),
+                        option.result_summary,
+                    ),
+                )
                 self._option_by_item[option_id] = option
                 self._option_rows_by_item[option_id] = work_rows
                 self._result_options.append(option)
-                for row in work_rows:
-                    item_id = self._result_tree.insert(
-                        option_id,
-                        tk.END,
-                        text=row.display_path,
-                        values=(
-                            row.face,
-                            self._format_li_salt_percent(row.li_salt_percent),
-                            self._row_result_summary(row),
-                        ),
-                    )
-                    self._row_by_item[item_id] = row
         self._redraw_graph()
         self._redraw_heatmap()
 
     def _option_from_rows(self, rows: list[_ResultRow]) -> _ResultOption:
         first = rows[0]
-        li_avg = sum(row.li_salt_percent for row in rows) / len(rows)
+        li_values = [row.li_salt_percent for row in rows if row.li_salt_percent is not None]
         nonactive_values = [row.nonactive_percent for row in rows if row.nonactive_percent is not None]
-        if nonactive_values:
+        if li_values and nonactive_values:
+            li_avg = sum(li_values) / len(li_values)
             summary = f"Li {li_avg:.2f}% / Nonactive {sum(nonactive_values) / len(nonactive_values):.2f}%"
+        elif li_values:
+            summary = f"Li {sum(li_values) / len(li_values):.2f}% / Nonactive -"
         else:
-            summary = f"Li {li_avg:.2f}% / Nonactive -"
+            summary = "Li - / Nonactive -"
         return _ResultOption(
-            key=f"{first.date_name}|{first.work_label}",
+            key=f"{first.date_name}|{first.bundle_label}",
             date_name=first.date_name,
             analysis_id=first.analysis_id,
             analysis_path=first.analysis_path,
             csv_path=first.csv_path,
             cell=first.cell,
-            label=first.work_label,
+            label=first.bundle_label,
             result_summary=summary,
         )
+
+    def _average_li_salt(self, rows: list[_ResultRow]) -> float | None:
+        values = [row.li_salt_percent for row in rows if row.li_salt_percent is not None]
+        return sum(values) / len(values) if values else None
+
+    def _faces_summary(self, rows: list[_ResultRow]) -> str:
+        faces = sorted({row.face for row in rows if row.face})
+        if not faces:
+            return "-"
+        if len(faces) <= 3:
+            return "/".join(faces)
+        return "Mixed"
 
     def _discover_result_options(self, date_name: str, date_path: Path) -> list[_ResultOption]:
         options: list[_ResultOption] = []
@@ -588,7 +714,6 @@ class AnalysisTab(ttk.Frame):
         return rows
 
     def _row_from_mask(self, root_path: Path, mask_image: Path) -> _ResultRow | None:
-        li_percent, nonactive_percent = self._percentages_from_mask_image(mask_image)
         pass_image = self._pass_image_for_mask(mask_image)
         analysis_path = self._analysis_path_for_mask_folder(mask_image.parent)
         date_name = self._date_label_for_path(root_path, analysis_path)
@@ -601,8 +726,6 @@ class AnalysisTab(ttk.Frame):
             "Cell": 1,
             "Face": face,
             "ImageNum": image_num,
-            "nonactive_ratio": nonactive_percent / 100.0,
-            "li_salt_ratio": li_percent / 100.0,
         }
         return _ResultRow(
             key=str(mask_image),
@@ -615,8 +738,8 @@ class AnalysisTab(ttk.Frame):
             cell=1,
             face=face,
             image_num=image_num,
-            li_salt_percent=li_percent,
-            nonactive_percent=nonactive_percent,
+            li_salt_percent=None,
+            nonactive_percent=None,
             pass_image=pass_image,
             mask_image=mask_image,
             row=row,
@@ -659,7 +782,10 @@ class AnalysisTab(ttk.Frame):
         return "No date"
 
     def _work_folder_label(self, root_path: Path, analysis_path: Path, date_name: str) -> str:
-        base = root_path / date_name if date_name != "No date" else root_path
+        if date_name != "No date" and root_path.name != date_name:
+            base = root_path / date_name
+        else:
+            base = root_path
         try:
             rel = analysis_path.relative_to(base)
             return rel.as_posix() or analysis_path.name
@@ -778,7 +904,9 @@ class AnalysisTab(ttk.Frame):
         return path.suffix.lower() == ".csv" and ("LI-SALT" in name or "LI_SALT" in name)
 
     @staticmethod
-    def _format_li_salt_percent(value: float) -> str:
+    def _format_li_salt_percent(value: float | None) -> str:
+        if value is None:
+            return "-"
         if value == 0:
             return "0.00"
         if abs(value) < 0.01:
@@ -786,6 +914,8 @@ class AnalysisTab(ttk.Frame):
         return f"{value:.2f}"
 
     def _row_result_summary(self, row: _ResultRow) -> str:
+        if row.li_salt_percent is None:
+            return "Li - / Nonactive -"
         if row.nonactive_percent is None:
             return f"Li {row.li_salt_percent:.2f}% / Nonactive -"
         return f"Li {row.li_salt_percent:.2f}% / Nonactive {row.nonactive_percent:.2f}%"
@@ -879,24 +1009,37 @@ class AnalysisTab(ttk.Frame):
 
     def _sync_result_tree_styles(self) -> None:
         for item_id, option in self._option_by_item.items():
-            tags = ("selected",) if option.key in self._selected_options else ()
+            tags = ("selected",) if option.key in self._selected_options or item_id == self._active_result_item else ()
             self._result_tree.item(item_id, tags=tags)
         for item_id in self._row_by_item:
             tags = ("selected",) if item_id == self._active_result_item else ()
             self._result_tree.item(item_id, tags=tags)
 
     def _sort_results(self, column: str) -> None:
-        rows = list(self._row_by_item.values())
+        rows = list(self._current_result_rows)
         if column == "li_salt":
-            rows.sort(key=lambda row: row.li_salt_percent)
+            averages = self._bundle_li_salt_averages(rows)
+            rows.sort(key=lambda row: (averages.get((row.date_name, row.bundle_label), float("inf")), row.image_num, row.display_path))
         elif column == "face":
-            rows.sort(key=lambda row: (row.face, row.date_name, row.work_label, row.image_num))
+            rows.sort(key=lambda row: (self._faces_sort_key(rows, row), row.date_name, row.bundle_label, row.image_num))
         else:
-            rows.sort(key=lambda row: (row.date_name, row.work_label, row.display_path))
+            rows.sort(key=lambda row: (row.date_name, row.bundle_label, row.display_path))
         self._set_result_rows(rows)
 
+    def _bundle_li_salt_averages(self, rows: list[_ResultRow]) -> dict[tuple[str, str], float]:
+        grouped: dict[tuple[str, str], list[float]] = {}
+        for row in rows:
+            if row.li_salt_percent is not None:
+                grouped.setdefault((row.date_name, row.bundle_label), []).append(row.li_salt_percent)
+        return {key: sum(values) / len(values) for key, values in grouped.items()}
+
+    def _faces_sort_key(self, rows: list[_ResultRow], target: _ResultRow) -> str:
+        faces = sorted({row.face for row in rows if row.date_name == target.date_name and row.bundle_label == target.bundle_label})
+        return "/".join(faces)
+
     def _select_result_item(self, item_id: str) -> None:
-        row = self._row_by_item[item_id]
+        row = self._ensure_row_metrics(self._row_by_item[item_id])
+        self._row_by_item[item_id] = row
         self._active_result_item = item_id
         self._selected_options.clear()
         self._all_series_points = [self._series_point_from_row(row)]
@@ -907,27 +1050,53 @@ class AnalysisTab(ttk.Frame):
         self._redraw_heatmap()
 
     def _select_result_option(self, item_id: str) -> None:
-        rows = self._option_rows_by_item[item_id]
+        rows = [self._ensure_row_metrics(row) for row in self._option_rows_by_item[item_id]]
+        option = self._option_by_item[item_id]
+        self._option_rows_by_item[item_id] = rows
         self._active_result_item = item_id
-        self._selected_options.clear()
-        self._all_series_points = [self._series_point_from_row(row) for row in rows]
+        self._selected_options = {option.key: option}
+        self._all_series_points = [
+            self._series_point_from_row(row, option_key=option.key, label=option.label)
+            for row in rows
+        ]
         self._shown_point = self._all_series_points[0] if self._all_series_points else None
-        self._heatmap_option_key = rows[0].key if rows else None
+        self._heatmap_option_key = option.key if rows else None
         self._sync_result_tree_styles()
         self._redraw_graph()
         self._redraw_heatmap()
 
-    def _series_point_from_row(self, row: _ResultRow) -> _SeriesPoint:
+    def _series_point_from_row(
+        self,
+        row: _ResultRow,
+        *,
+        option_key: str | None = None,
+        label: str | None = None,
+    ) -> _SeriesPoint:
+        row = self._ensure_row_metrics(row)
         return _SeriesPoint(
-            option_key=row.key,
-            label=row.work_label,
+            option_key=option_key or row.key,
+            label=label or row.work_label,
             face=row.face,
             image_num=row.image_num,
-            percent=row.li_salt_percent,
+            percent=row.li_salt_percent or 0.0,
             is_issue=self._coerce_bool(row.row.get("isIssue", False)),
             row=dict(row.row),
             pass_image=row.pass_image,
             mask_image=row.mask_image if row.mask_image and row.mask_image.exists() else None,
+        )
+
+    def _ensure_row_metrics(self, row: _ResultRow) -> _ResultRow:
+        if row.li_salt_percent is not None or row.mask_image is None:
+            return row
+        li_percent, nonactive_percent = self._percentages_from_mask_image(row.mask_image)
+        row_dict = dict(row.row)
+        row_dict["li_salt_ratio"] = li_percent / 100.0
+        row_dict["nonactive_ratio"] = nonactive_percent / 100.0
+        return replace(
+            row,
+            li_salt_percent=li_percent,
+            nonactive_percent=nonactive_percent,
+            row=row_dict,
         )
 
     def _remove_option_series(self, option_key: str) -> None:

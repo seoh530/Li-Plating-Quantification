@@ -110,6 +110,18 @@ CREATE TABLE IF NOT EXISTS prediction_runs (
 """
 
 
+CREATE_QC_FAILURES_SQL = """
+CREATE TABLE IF NOT EXISTS qc_failures (
+    qc_failure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_path TEXT NOT NULL UNIQUE,
+    folder_path TEXT,
+    failure_reason TEXT,
+    status TEXT,
+    created_at TEXT
+)
+"""
+
+
 PREDICTION_RUN_COLUMN_DEFINITIONS: dict[str, str] = {
     "run_timestamp": "TEXT",
     "analysis_id": "TEXT",
@@ -158,6 +170,7 @@ PREDICTION_RUN_COLUMN_DEFINITIONS: dict[str, str] = {
 
 def ensure_prediction_schema(conn: sqlite3.Connection) -> None:
     conn.execute(CREATE_PREDICTION_RUNS_SQL)
+    conn.execute(CREATE_QC_FAILURES_SQL)
     existing = {
         str(row[1])
         for row in conn.execute("PRAGMA table_info(prediction_runs)").fetchall()

@@ -1,7 +1,9 @@
 import sys
 import queue
+import time
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import tkinter as tk
 from tkinter import ttk
@@ -14,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from gui.workflow_tab import WorkflowTab, _ImageTask, _QuickQCHoldError, _StageSource
+from modules.storage.sqlite_logger import SQLitePredictionLogger
 
 
 def make_tab() -> WorkflowTab:
@@ -25,6 +28,24 @@ def make_tab() -> WorkflowTab:
     return tab
 
 
+def _write_storage_config(path: Path, db_name: str = "qcml_test.db") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"""
+app:
+  root_path: "{path.parent.as_posix()}"
+folder_qc:
+  analysis_id_pattern: '^[A-Z]{{3}}[0-9]{{5}}$'
+  date_formats:
+    - '%Y-%m-%d'
+storage:
+  sqlite:
+    path: "{db_name}"
+""".strip(),
+        encoding="utf-8",
+    )
+
+
 class FakeVar:
     def __init__(self, value: str) -> None:
         self.value = value
@@ -34,6 +55,17 @@ class FakeVar:
 
     def set(self, value: str) -> None:
         self.value = value
+
+
+class FakeWidget:
+    def __init__(self) -> None:
+        self.kwargs = {}
+
+    def config(self, **kwargs) -> None:
+        self.kwargs.update(kwargs)
+
+    def configure(self, **kwargs) -> None:
+        self.config(**kwargs)
 
 
 def test_folder_status_uses_shallow_scan_for_nested_images(tmp_path) -> None:
@@ -50,6 +82,34 @@ def test_folder_status_uses_shallow_scan_for_nested_images(tmp_path) -> None:
         "PASS missing 0/1",
         "folder_fail",
     )
+
+
+def test_poll_queue_batches_and_coalesces_repeated_messages() -> None:
+    tab = make_tab()
+    tab._queue = queue.Queue()
+    dispatched = []
+    for index in range(30):
+        tab._queue.put(("current", f"item {index}"))
+    tab._dispatch = lambda msg_type, payload: dispatched.append((msg_type, payload))
+    tab.after = lambda *_args, **_kwargs: None
+
+    tab._poll_queue()
+
+    assert dispatched == [("current", "item 19")]
+    assert tab._queue.qsize() == 10
+
+
+def test_progress_dispatch_does_not_refresh_filesystem_while_running(tmp_path) -> None:
+    tab = make_tab()
+    tab._running = True
+    tab._progress = FakeWidget()
+    refresh_calls = []
+    tab._refresh_item_status = lambda *args, **kwargs: refresh_calls.append((args, kwargs))
+
+    tab._dispatch("progress", (3, "2026-08-08", tmp_path, "AHG00001", tmp_path / "work"))
+
+    assert tab._progress.kwargs["value"] == 3
+    assert refresh_calls == []
 
 
 def test_folder_status_counts_direct_conventional_outputs_only(tmp_path) -> None:
@@ -320,6 +380,136 @@ def test_work_folder_crop_collects_all_qc_failures(tmp_path) -> None:
     assert failures[0]["image_path"] == first
 
 
+def test_qc_failure_db_upsert_keeps_one_row_per_image(tmp_path) -> None:
+    config_path = tmp_path / "config" / "thresholds.yaml"
+    _write_storage_config(config_path)
+    logger = SQLitePredictionLogger(config_path)
+    image_path = tmp_path / "2026-08-08" / "issue" / "image_1.jpg"
+    folder_path = image_path.parent
+
+    logger.upsert_qc_failure(
+        image_path=image_path,
+        folder_path=folder_path,
+        failure_reason="Aspect ratio out of tolerance",
+        status="FAIL",
+    )
+    logger.upsert_qc_failure(
+        image_path=image_path,
+        folder_path=folder_path,
+        failure_reason="Angle tolerance exceeded",
+        status="FAIL",
+    )
+
+    assert logger.db_path is not None
+    with sqlite3.connect(logger.db_path) as conn:
+        rows = conn.execute(
+            "SELECT image_path, folder_path, failure_reason, status, created_at FROM qc_failures"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == str(image_path)
+    assert rows[0][1] == str(folder_path)
+    assert rows[0][2] == "Angle tolerance exceeded"
+    assert rows[0][3] == "FAIL"
+    assert rows[0][4]
+
+
+def test_qc_failure_db_lists_only_fail_and_pending(tmp_path) -> None:
+    config_path = tmp_path / "config" / "thresholds.yaml"
+    _write_storage_config(config_path)
+    logger = SQLitePredictionLogger(config_path)
+    fail_image = tmp_path / "issue" / "fail.jpg"
+    pending_image = tmp_path / "issue" / "pending.jpg"
+    resolved_image = tmp_path / "issue" / "resolved.jpg"
+
+    logger.upsert_qc_failure(image_path=fail_image, folder_path=fail_image.parent, failure_reason="fail", status="FAIL")
+    logger.upsert_qc_failure(image_path=pending_image, folder_path=pending_image.parent, failure_reason="pending", status="PENDING")
+    logger.upsert_qc_failure(image_path=resolved_image, folder_path=resolved_image.parent, failure_reason="resolved", status="FAIL")
+    logger.update_qc_failure_status(resolved_image, "RESOLVED")
+
+    assert [Path(row["image_path"]).name for row in logger.list_qc_failures()] == [
+        "fail.jpg",
+        "pending.jpg",
+    ]
+
+
+def test_persistent_qc_failure_entry_defers_missing_file_check(tmp_path) -> None:
+    tab = make_tab()
+    tab._root_path = tmp_path
+    tab._customer_var = FakeVar("ETC")
+    record = {
+        "image_path": str(tmp_path / "issue" / "missing.jpg"),
+        "folder_path": str(tmp_path / "issue"),
+        "failure_reason": "Aspect ratio out of tolerance",
+        "status": "FAIL",
+        "created_at": "2026-09-03T10:00:00",
+    }
+
+    entry = tab._qc_failure_entry_from_record(record)
+
+    assert entry is not None
+    assert entry["status"] == "FAIL"
+    assert entry["type"] == "qc_ng"
+    assert str(entry["failure"]["folder_path"]) == str(tmp_path / "issue")
+
+
+def test_qc_ng_action_runs_ml_after_success(tmp_path, monkeypatch) -> None:
+    tab = make_tab()
+    image_path = tmp_path / "issue" / "image_1.jpg"
+    image_path.parent.mkdir()
+    image_path.write_bytes(b"image")
+    failure = {
+        "id": str(image_path),
+        "image_path": image_path,
+        "folder_path": image_path.parent,
+        "output_path": image_path.parent / "_PASS" / "image_1.png",
+        "fail_reasons": ["Aspect ratio out of tolerance"],
+        "customer_code": "H",
+        "skip_size_validation": False,
+        "image_postprocess": None,
+    }
+    queue_items = []
+    ml_calls = []
+    status_updates = []
+
+    class FakeLogger:
+        def update_qc_failure_status(self, *args, **kwargs):
+            status_updates.append((args, kwargs))
+
+    class ImmediateThread:
+        def __init__(self, target, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr("gui.workflow_tab.threading.Thread", ImmediateThread)
+    tab._sqlite_logger = FakeLogger()
+    tab._retake_review_btn = FakeWidget()
+    tab._crop_review_btn = FakeWidget()
+    tab._retake_qc_fail_btn = FakeWidget()
+    tab._crop_qc_fail_btn = FakeWidget()
+    tab._status_label = FakeWidget()
+    tab._queue = SimpleNamespace(put=lambda item: queue_items.append(item))
+    tab._process_failed_qc_item = lambda _failure, *, force: SimpleNamespace(
+        status="PASS",
+        fail_reasons=[],
+        output_path=_failure["output_path"],
+    )
+    tab._run_ml_for_failed_qc_item = lambda _failure: ml_calls.append(_failure)
+    entry = {
+        "type": "qc_ng",
+        "held_key": "persistent|image_1",
+        "failure_id": str(image_path),
+        "failure": failure,
+    }
+
+    tab._process_qc_ng_entry(entry, force=False)
+
+    assert status_updates[0][0] == (image_path, "PENDING")
+    assert ml_calls == [failure]
+    assert queue_items[0][0] == "qc_ng_action_done"
+    assert queue_items[0][1]["status"] == "PASS"
+
 def test_stage_paths_accepts_subprocess_visible_teamroom_path(tmp_path, monkeypatch) -> None:
     tab = make_tab()
     config_path = tmp_path / "config" / "thresholds.yaml"
@@ -474,7 +664,21 @@ def test_verify_stage_copy_rejects_empty_unknown_folder(tmp_path) -> None:
         raise AssertionError("Expected empty staged folder to fail")
 
 
-def test_refresh_root_tree_auto_expands_single_cell_folder(tmp_path) -> None:
+def _take_queue_message(tab: WorkflowTab, expected_type: str, root: tk.Tk):
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        root.update()
+        try:
+            message = tab._queue.get_nowait()
+        except queue.Empty:
+            time.sleep(0.01)
+            continue
+        if message[0] == expected_type:
+            return message[1]
+    raise AssertionError(f"Timed out waiting for {expected_type}")
+
+
+def test_refresh_root_tree_loads_children_lazily(tmp_path) -> None:
     tab = make_tab()
     staging_root = tmp_path / "stage"
     cell_path = staging_root / "Cell #2"
@@ -490,10 +694,25 @@ def test_refresh_root_tree_auto_expands_single_cell_folder(tmp_path) -> None:
         tab._root_tree = ttk.Treeview(root)
         tab._root_tree_paths = {}
         tab._status_label = ttk.Label(root)
+        tab._refresh_btn = ttk.Button(root)
+        tab._running = False
+        tab._queue = queue.Queue()
         tab._refresh_root_tree()
 
         root_id = tab._root_tree.get_children("")[0]
+        assert tab._root_tree.item(root_id, "values")[3] == "Loading..."
+
+        payload = _take_queue_message(tab, "folder_tree_ready", root)
+        tab._apply_folder_tree_payload(root_id, payload)
+
         cell_id = tab._root_tree.get_children(root_id)[0]
+        assert not tab._root_tree.item(cell_id, "open")
+        assert tab._root_tree.item(tab._root_tree.get_children(cell_id)[0], "text") == "..."
+
+        tab._start_root_tree_children_load(cell_id, cell_path)
+        payload = _take_queue_message(tab, "folder_tree_children_ready", root)
+        tab._apply_folder_tree_payload(cell_id, payload)
+
         child_names = [
             tab._root_tree.item(child_id, "text")
             for child_id in tab._root_tree.get_children(cell_id)
@@ -503,10 +722,7 @@ def test_refresh_root_tree_auto_expands_single_cell_folder(tmp_path) -> None:
             values = tab._root_tree.item(face_id, "values")
             face_image_counts[tab._root_tree.item(face_id, "text")] = values[0]
 
-        assert tab._root_tree.item(cell_id, "open")
         assert child_names == ["BACK", "FRONT"]
-        assert tab._root_tree.item(tab._root_tree.get_children(cell_id)[0], "open")
-        assert tab._root_tree.item(tab._root_tree.get_children(cell_id)[1], "open")
         assert face_image_counts == {
             "BACK": "1",
             "FRONT": "1",

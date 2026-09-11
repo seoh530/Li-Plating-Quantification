@@ -3,9 +3,12 @@
 import logging
 import os
 import sys
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from pathlib import Path
+
+DEBUG = False
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 project_root_str = str(PROJECT_ROOT)
@@ -33,6 +36,57 @@ for _package_name in ("modules", "gui"):
                 sys.modules.pop(_name, None)
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "thresholds.yaml"
+
+
+class _StartupTimer:
+    def __init__(self, enabled: bool) -> None:
+        self._enabled = enabled
+        self._start = time.perf_counter()
+        self._last = self._start
+
+    def mark(self, label: str) -> None:
+        if not self._enabled:
+            return
+        now = time.perf_counter()
+        logging.debug(
+            "startup %-32s step=%.3fs total=%.3fs",
+            label,
+            now - self._last,
+            now - self._start,
+        )
+        self._last = now
+
+
+class LazyTab(ttk.Frame):
+    """Placeholder that builds the real tab only when first selected."""
+
+    def __init__(self, parent, title: str, factory) -> None:
+        super().__init__(parent)
+        self._title = title
+        self._factory = factory
+        self._created = False
+        self._content = None
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        ttk.Label(
+            self,
+            text=f"Click to load {title.strip()}",
+            foreground="#555555",
+        ).grid(row=0, column=0)
+
+    @property
+    def content(self):
+        return self._content
+
+    def ensure_loaded(self):
+        if self._created:
+            return self._content
+        for child in self.winfo_children():
+            child.destroy()
+        self._content = self._factory(self)
+        self._content.grid(row=0, column=0, sticky=tk.NSEW)
+        self._created = True
+        return self._content
 
 
 def _create_loading_page(root: tk.Tk) -> tuple[ttk.Frame, ttk.Label, ttk.Progressbar]:
@@ -63,7 +117,8 @@ def _create_loading_page(root: tk.Tk) -> tuple[ttk.Frame, ttk.Label, ttk.Progres
 
 
 def main() -> None:
-    debug_enabled = os.environ.get("QCML_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+    debug_enabled = DEBUG or os.environ.get("QCML_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+    startup_timer = _StartupTimer(debug_enabled)
     logging.basicConfig(
         level=logging.DEBUG if debug_enabled else logging.WARNING,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -71,6 +126,7 @@ def main() -> None:
     )
 
     root = tk.Tk()
+    startup_timer.mark("tk root")
     root.title("Cell Li-Plating Quantification System")
     root.geometry("1280x820")
     root.minsize(1100, 720)
@@ -81,16 +137,16 @@ def main() -> None:
 
     loading, loading_status, progress = _create_loading_page(root)
     root.update_idletasks()
+    startup_timer.mark("loading page")
 
     def build_main_ui() -> None:
         try:
-            loading_status.config(text="Loading workflow and analysis modules...")
+            loading_status.config(text="Loading workflow module...")
             root.update_idletasks()
 
+            startup_timer.mark("before workflow import")
             from gui.workflow_tab import WorkflowTab
-            from gui.analysis_tab import AnalysisTab
-            from gui.settings_tab import SettingsTab
-            from gui.guide_tab import GuideTab
+            startup_timer.mark("workflow import")
 
             notebook = ttk.Notebook(root)
             reloadable_tabs = []
@@ -99,42 +155,68 @@ def main() -> None:
                 for tab in reloadable_tabs:
                     tab.reload_config()
 
+            def add_reloadable(tab) -> None:
+                if tab not in reloadable_tabs:
+                    reloadable_tabs.append(tab)
+
+            def on_tab_changed(_event=None) -> None:
+                selected = notebook.nametowidget(notebook.select())
+                if not isinstance(selected, LazyTab):
+                    return
+                startup_timer.mark(f"before lazy {selected._title.strip()}")
+                try:
+                    tab = selected.ensure_loaded()
+                    if hasattr(tab, "reload_config"):
+                        add_reloadable(tab)
+                    startup_timer.mark(f"lazy {selected._title.strip()} loaded")
+                except Exception as exc:
+                    logging.exception("%s tab startup failed", selected._title.strip())
+                    messagebox.showerror("Startup Error", f"{selected._title.strip()} tab failed: {exc}")
+
             loading_status.config(text="Building Workflow tab...")
             root.update_idletasks()
+            startup_timer.mark("before workflow tab")
             workflow_tab = WorkflowTab(notebook, config_path=CONFIG_PATH)
             notebook.add(workflow_tab, text="  Workflow  ")
-            reloadable_tabs.append(workflow_tab)
+            add_reloadable(workflow_tab)
+            startup_timer.mark("workflow tab")
 
-            loading_status.config(text="Building Analysis tab...")
-            root.update_idletasks()
-            analysis_tab = AnalysisTab(
+            analysis_lazy = LazyTab(
                 notebook,
-                config_path=CONFIG_PATH,
+                "Analysis",
+                lambda parent: __import__("gui.analysis_tab", fromlist=["AnalysisTab"]).AnalysisTab(
+                    parent,
+                    config_path=CONFIG_PATH,
+                ),
             )
-            notebook.add(analysis_tab, text="  Analysis  ")
-            reloadable_tabs.append(analysis_tab)
+            notebook.add(analysis_lazy, text="  Analysis  ")
 
-            loading_status.config(text="Building Settings tab...")
-            root.update_idletasks()
-            settings_tab = SettingsTab(
+            settings_lazy = LazyTab(
                 notebook,
-                config_path=CONFIG_PATH,
-                on_config_saved=reload_tabs_from_config,
+                "Settings",
+                lambda parent: __import__("gui.settings_tab", fromlist=["SettingsTab"]).SettingsTab(
+                    parent,
+                    config_path=CONFIG_PATH,
+                    on_config_saved=reload_tabs_from_config,
+                ),
             )
-            notebook.add(settings_tab, text="  Settings  ")
+            notebook.add(settings_lazy, text="  Settings  ")
 
-            loading_status.config(text="Building Guide tab...")
-            root.update_idletasks()
-            guide_tab = GuideTab(
+            guide_lazy = LazyTab(
                 notebook,
-                config_path=CONFIG_PATH,
+                "Guide",
+                lambda parent: __import__("gui.guide_tab", fromlist=["GuideTab"]).GuideTab(
+                    parent,
+                    config_path=CONFIG_PATH,
+                ),
             )
-            notebook.add(guide_tab, text="  Guide  ")
-            reloadable_tabs.append(guide_tab)
+            notebook.add(guide_lazy, text="  Guide  ")
+            notebook.bind("<<NotebookTabChanged>>", on_tab_changed, add="+")
 
             progress.stop()
             loading.destroy()
             notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+            startup_timer.mark("notebook visible")
         except Exception as exc:
             logging.exception("Application startup failed")
             progress.stop()
