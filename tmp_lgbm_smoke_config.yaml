@@ -1,0 +1,22 @@
+ml:
+  model_path: tmp_lgbm_smoke
+  num_threads: 4
+  edge_hsv_range:
+    lower:
+    - 0
+    - 0
+    - 0
+    upper:
+    - 179
+    - 255
+    - 255
+  nonactive_hsv_range:
+    lower:
+    - 0
+    - 0
+    - 0
+    upper:
+    - 179
+    - 255
+    - 255
+  edge_margin_px: 1

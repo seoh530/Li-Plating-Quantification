@@ -1,0 +1,2 @@
+"""Report image generation helpers."""
+
