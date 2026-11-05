@@ -100,3 +100,9 @@ def build_test_output_name(analysis_path: str | Path, image_path: str | Path) ->
     return f"{image_path.stem}__{digest}.png"
 
 
+
+
+def compile_cell_pattern(value: str):
+    """Accept legacy YAML values that double-escaped regex whitespace/digits."""
+    normalized=str(value).replace(r'\\s',r'\s').replace(r'\\d',r'\d')
+    return re.compile(normalized,re.IGNORECASE)

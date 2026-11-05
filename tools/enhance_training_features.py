@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modules.ml.feature_extractor import FeatureExtractor
+from modules.ml.label_data import validate_label_rows
 from modules.utils.image_io import quiet_imread
 
 logger = logging.getLogger(__name__)
@@ -137,8 +138,7 @@ def load_label_frame(csv_files: list[Path]) -> pd.DataFrame:
         frame["source_csv"] = str(csv_path)
         frames.append(frame)
     data = pd.concat(frames, ignore_index=True)
-    data["x"] = pd.to_numeric(data["x"], errors="raise").astype(int)
-    data["y"] = pd.to_numeric(data["y"], errors="raise").astype(int)
+    data = validate_label_rows(data)
     return data.sort_values(
         by=["source_csv", "filename", "x", "y"],
         kind="mergesort",
@@ -163,36 +163,50 @@ def build_image_roots(csv_files: list[Path], explicit_roots: list[str]) -> list[
     return unique
 
 
-def build_image_index(image_roots: list[Path]) -> dict[str, Path]:
-    index: dict[str, Path] = {}
+def build_image_index(image_roots: list[Path]) -> dict[str, Path | None]:
+    # None marks an ambiguous basename. Never silently use another cell's image.
+    index: dict[str, Path | None] = {}
+    def register(path: Path) -> None:
+        resolved = path.resolve()
+        if path.name not in index:
+            index[path.name] = resolved
+        elif index[path.name] != resolved:
+            index[path.name] = None
+
     for root in image_roots:
         if root.is_file() and root.suffix.lower() in IMAGE_EXTENSIONS:
-            index.setdefault(root.name, root)
+            register(root)
             continue
         if not root.is_dir():
             continue
         for path in root.rglob("*"):
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
-                index.setdefault(path.name, path)
+                register(path)
     return index
 
 
-def resolve_image_path(filename: str, csv_path: Path, image_index: dict[str, Path]) -> Path:
+def resolve_image_path(filename: str, csv_path: Path, image_index: dict[str, Path | None]) -> Path:
     raw_path = Path(str(filename))
     candidates = []
     if raw_path.is_absolute():
         candidates.append(raw_path)
     else:
         candidates.extend([
-            Path.cwd() / raw_path,
             csv_path.parent / raw_path,
+            Path.cwd() / raw_path,
         ])
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     basename = raw_path.name
     if basename in image_index:
-        return image_index[basename]
+        matched = image_index[basename]
+        if matched is None:
+            raise RuntimeError(
+                f"Ambiguous image filename '{filename}'. Multiple images share this "
+                "basename. Use a path relative to the label CSV or an absolute path."
+            )
+        return matched
     raise RuntimeError(
         f"Image not found for filename='{filename}'. Pass --image-root pointing to cropped/QC-ready images."
     )

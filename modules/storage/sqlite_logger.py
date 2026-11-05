@@ -121,6 +121,45 @@ class SQLitePredictionLogger:
             logger.exception("SQLite monitoring duplicate check failed")
         return existing
 
+    def save_prediction_batch(
+        self,
+        records: list[Mapping[str, object]],
+        *,
+        replace_pairs: set[tuple[str, str]] | None = None,
+    ) -> bool:
+        """Replace completed cells and insert their new rows in one transaction.
+
+        Call only after all selected images and the result CSV have succeeded.
+        On any insert failure SQLite rolls back the deletes as well.
+        """
+        if not self._enabled or self._db_path is None or not records:
+            return False
+        completed_pairs = {
+            (str(row.get("analysis_id", "")), str(row.get("cell", "")))
+            for row in records
+        }
+        replacements = (replace_pairs or set()) & completed_pairs
+        columns = ", ".join(PREDICTION_RUN_COLUMNS)
+        placeholders = ", ".join("?" for _ in PREDICTION_RUN_COLUMNS)
+        values = [
+            [self._sqlite_value(row.get(column)) for column in PREDICTION_RUN_COLUMNS]
+            for row in records
+        ]
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.executemany(
+                    "DELETE FROM prediction_runs WHERE analysis_id = ? AND cell = ?",
+                    sorted(replacements),
+                )
+                conn.executemany(
+                    f"INSERT INTO prediction_runs ({columns}) VALUES ({placeholders})",
+                    values,
+                )
+            return True
+        except Exception:
+            logger.exception("SQLite batch failed; previous cell records retained")
+            return False
+
     def delete_prediction_cells(self, pairs: set[tuple[str, str]]) -> None:
         """Delete existing monitoring rows for selected AnalysisID/cell pairs."""
         if not self._enabled or self._db_path is None or not pairs:

@@ -22,6 +22,7 @@ class SingleMaskResult:
     image_path: Path
     label_mask: np.ndarray
     mask_image: np.ndarray
+    source_image: np.ndarray | None = None
 
 
 class SingleMaskEngine:
@@ -29,7 +30,7 @@ class SingleMaskEngine:
         self._config_path = Path(config_path)
         with open(self._config_path, encoding='utf-8') as fh:
             cfg = yaml.safe_load(fh) or {}
-        model_dir = resolve_model_path('models/V2F')
+        model_dir = resolve_model_path(cfg['ml']['model_path'])
         normal_cfg = dict(cfg.get('normalization', {}) or {})
         self._feature_extractor = FeatureExtractor(self._config_path)
         self._inference = InferenceEngine(self._config_path, model_path=model_dir)
@@ -56,9 +57,13 @@ class SingleMaskEngine:
             max_b_shift=float(normal_cfg.get('max_b_shift', 5)),
         )
 
-    def process_path(self, image_path) -> SingleMaskResult:
+    def process_path(self, image_path, progress_callback=None) -> SingleMaskResult:
         image_path = Path(image_path)
+        if progress_callback:
+            progress_callback('Cropping source image…')
         source = self._crop_source(image_path)
+        if progress_callback:
+            progress_callback('Segmenting cropped image…')
 
         labels, confidence = self._predict(source)
         if self._should_normalize(source, labels, confidence):
@@ -76,9 +81,20 @@ class SingleMaskEngine:
             image_path=image_path,
             label_mask=labels,
             mask_image=self._quantifier.build_mask_image(labels),
+            source_image=source,
         )
 
     def _crop_source(self, image_path):
+        image = quiet_imread(image_path, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise RuntimeError(f'Unable to read image: {Path(image_path).name}')
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] not in (3, 4):
+            raise RuntimeError('Use an 8-bit RGB or RGBA image for segmentation.')
+        if image.shape[2] == 4 and np.any(image[:,:,3] == 0):
+            # Already QC-cropped: retain the source coordinate system and alpha.
+            if not np.any(image[:,:,3] > 0):
+                raise RuntimeError('The image has no non-transparent cell pixels.')
+            return image
         with tempfile.TemporaryDirectory(prefix='single_mask_') as temp_dir:
             cropped_path = Path(temp_dir) / f'{image_path.stem}.png'
             postprocess = (
@@ -99,14 +115,12 @@ class SingleMaskEngine:
                 reasons = ' | '.join(crop_result.fail_reasons)
                 detail = f': {reasons}' if reasons else ''
                 raise RuntimeError(f'Background crop failed{detail}')
+            if cropped.ndim != 3 or cropped.shape[2] != 4 or not np.any(cropped[:,:,3] > 0):
+                raise RuntimeError('Crop did not produce a valid cell region.')
             return cropped
 
     def _predict(self, image):
-        features = self._feature_extractor.extract(
-            image,
-            downsample_factor=self._inference.downsample_factor,
-            feature_columns=self._inference.feature_columns,
-        )
+        features = self._inference.extract_features(image)
         return self._inference.predict_mask_with_confidence(features)
 
     def _should_normalize(self, image, labels, confidence) -> bool:

@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import cv2
 import numpy as np
 import yaml
 
@@ -10,6 +9,7 @@ from modules.ml.inference import (
     LABEL_INACTIVE,
     LABEL_LI_SALT,
 )
+from modules.utils.image_io import atomic_imwrite_png
 
 MASK_COLORS = {
     LABEL_BACKGROUND: (0, 255, 0),
@@ -79,10 +79,8 @@ class Quantifier:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         mask_image = self.build_mask_image(label_mask)
-        success = cv2.imwrite(
-            str(output_path),
-            mask_image,
-            [cv2.IMWRITE_PNG_COMPRESSION, self._png_compression_level],
+        success = atomic_imwrite_png(
+            output_path, mask_image, compression=self._png_compression_level
         )
         if not success:
             raise RuntimeError(f"Failed to write mask image: {output_path}")

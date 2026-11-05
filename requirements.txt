@@ -28,3 +28,8 @@ tkinterdnd2>=0.4.2
 
 # Testing
 pytest>=7.4.0
+
+# PDF reports and in-app page preview
+reportlab>=4.0
+matplotlib>=3.8
+PyMuPDF>=1.24

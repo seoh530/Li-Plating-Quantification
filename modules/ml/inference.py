@@ -66,6 +66,14 @@ class InferenceEngine:
                 f"Logical model {self._model_dir.name} must declare feature_set=enhanced in metadata.json"
             )
         self._classes = tuple(self._metadata["classes"])
+        if self._classes != ("b", "l", "n"):
+            raise RuntimeError(
+                f"Unsupported class order {self._classes}; expected ('b', 'l', 'n')."
+            )
+        self._extractor = FeatureExtractor(
+            config_path,
+            feature_config=self._metadata.get("feature_extraction"),
+        )
         self._best_iteration = int(self._metadata.get("best_iteration", -1) or -1)
         self._logged_feature_rebuild = False
         self._booster = None
@@ -146,6 +154,14 @@ class InferenceEngine:
         """Classify all valid pixels."""
         predicted_codes, _confidence = self.predict_codes_with_confidence(features)
         return predicted_codes
+
+    def extract_features(self, image: np.ndarray) -> FeatureBatch:
+        """Build inference inputs using this model's training-time parameters."""
+        return self._extractor.extract(
+            image,
+            downsample_factor=self._downsample_factor,
+            feature_columns=self._feature_columns,
+        )
 
     def _predict_sklearn_scores(self, features: np.ndarray) -> np.ndarray:
         if self._estimator is None:
@@ -398,7 +414,12 @@ class InferenceEngine:
         ).astype(bool)
 
         valid_u8 = valid.astype(np.uint8)
-        distance_from_outer = cv2.distanceTransform(valid_u8, cv2.DIST_L2, 3)
+        # An RGB image may be valid all the way to the frame boundary.
+        # Without an explicit zero border an all-valid mask has no exterior.
+        padded_valid = np.pad(valid_u8, 1, mode="constant", constant_values=0)
+        distance_from_outer = cv2.distanceTransform(
+            padded_valid, cv2.DIST_L2, 3
+        )[1:-1, 1:-1]
 
         search_limit = max(3.0, float(self._edge_margin_px) * 2.0)
         near_outer = valid & (distance_from_outer <= search_limit)

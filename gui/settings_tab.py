@@ -1,4 +1,4 @@
-﻿from collections.abc import Callable
+from collections.abc import Callable
 from pathlib import Path
 import re
 import tkinter as tk
@@ -6,8 +6,14 @@ from tkinter import filedialog, messagebox, ttk
 
 import yaml
 
-from modules.ml.model_registry import is_model_dir, list_model_options, project_root, resolve_model_path
+from modules.ml.model_registry import (
+    is_model_dir,
+    list_model_options,
+    project_root,
+    resolve_model_path,
+)
 from modules.utils.app_paths import user_database_path
+from modules.utils.image_io import atomic_write_text
 
 
 class SettingsTab(ttk.Frame):
@@ -34,27 +40,32 @@ class SettingsTab(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        content = ttk.Frame(self, padding=(18, 16, 18, 16))
+        content = ttk.Frame(self, padding=(24, 18, 24, 16))
         content.grid(row=0, column=0, sticky=tk.NSEW)
         content.columnconfigure(1, weight=1)
 
         ttk.Label(
             content,
-            text="Deployment Settings",
-            font=("TkDefaultFont", 16, "bold"),
+            text="Settings",
+            font=("Segoe UI", 19, "bold"),
         ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 14))
 
-        ttk.Label(content, text="Root path").grid(row=1, column=0, sticky=tk.W, padx=(0, 10))
-        self._root_entry = ttk.Entry(content, textvariable=self._root_path_var, width=90)
+        fields = ttk.Frame(content, style="Card.TFrame", padding=18)
+        fields.grid(row=1, column=0, columnspan=3, sticky=tk.EW)
+        fields.columnconfigure(1, weight=1)
+        ttk.Label(fields, style="Panel.TLabel", text="Root folder").grid(
+            row=1, column=0, sticky=tk.W, padx=(0, 10)
+        )
+        self._root_entry = ttk.Entry(fields, textvariable=self._root_path_var, width=60)
         self._root_entry.grid(row=1, column=1, sticky=tk.EW)
-        ttk.Button(content, text="Browse", command=self._browse_root_path).grid(
+        ttk.Button(fields, text="Browse", command=self._browse_root_path).grid(
             row=1,
             column=2,
             sticky=tk.W,
             padx=(8, 0),
         )
 
-        ttk.Label(content, text="Model path").grid(
+        ttk.Label(fields, style="Panel.TLabel", text="Model path").grid(
             row=2,
             column=0,
             sticky=tk.W,
@@ -62,13 +73,15 @@ class SettingsTab(ttk.Frame):
             pady=(10, 0),
         )
         self._model_combo = ttk.Combobox(
-            content,
+            fields,
             textvariable=self._model_path_var,
-            width=90,
+            width=60,
         )
         self._model_combo.grid(row=2, column=1, sticky=tk.EW, pady=(10, 0))
-        self._model_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_model_status())
-        ttk.Button(content, text="Browse", command=self._browse_model_path).grid(
+        self._model_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._refresh_model_status()
+        )
+        ttk.Button(fields, text="Browse", command=self._browse_model_path).grid(
             row=2,
             column=2,
             sticky=tk.W,
@@ -76,14 +89,20 @@ class SettingsTab(ttk.Frame):
             pady=(10, 0),
         )
 
-        ttk.Label(content, text="Model status").grid(
+        ttk.Label(fields, style="Panel.TLabel", text="Model status").grid(
             row=3,
             column=0,
             sticky=tk.W,
             padx=(0, 10),
             pady=(6, 0),
         )
-        ttk.Label(content, textvariable=self._model_status_var, foreground="#555555").grid(
+        ttk.Label(
+            fields,
+            style="Panel.TLabel",
+            textvariable=self._model_status_var,
+            foreground="#555555",
+            wraplength=650,
+        ).grid(
             row=3,
             column=1,
             columnspan=2,
@@ -91,14 +110,20 @@ class SettingsTab(ttk.Frame):
             pady=(6, 0),
         )
 
-        ttk.Label(content, text="SQLite DB").grid(
+        ttk.Label(fields, style="Panel.TLabel", text="SQLite DB").grid(
             row=4,
             column=0,
             sticky=tk.W,
             padx=(0, 10),
             pady=(10, 0),
         )
-        ttk.Label(content, textvariable=self._db_path_var, foreground="#555555").grid(
+        ttk.Label(
+            fields,
+            style="Panel.TLabel",
+            textvariable=self._db_path_var,
+            foreground="#555555",
+            wraplength=650,
+        ).grid(
             row=4,
             column=1,
             columnspan=2,
@@ -106,20 +131,26 @@ class SettingsTab(ttk.Frame):
             pady=(10, 0),
         )
 
-        actions = ttk.Frame(content)
+        actions = ttk.Frame(fields, style="Panel.TFrame")
         actions.grid(row=5, column=0, columnspan=3, sticky=tk.EW, pady=(16, 0))
-        ttk.Button(actions, text="Save settings", command=self._save).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Reload", command=self._load_values).pack(side=tk.LEFT, padx=(8, 0))
-        self._status_label = ttk.Label(actions, text="", foreground="#555555")
+        ttk.Button(
+            actions, text="Save settings", style="Accent.TButton", command=self._save
+        ).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Reload", command=self._load_values).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        self._status_label = ttk.Label(
+            actions, text="", style="Panel.TLabel", foreground="#555555"
+        )
         self._status_label.pack(side=tk.LEFT, padx=(12, 0))
 
-        notes = ttk.LabelFrame(self, text="Path rules", padding=12)
-        notes.grid(row=1, column=0, sticky=tk.NSEW, padx=18, pady=(0, 18))
+        notes = ttk.LabelFrame(self, text="Workspace settings", padding=12)
+        notes.grid(row=1, column=0, sticky="new", padx=24, pady=(0, 18))
         notes.columnconfigure(1, weight=1)
         rows = [
             (
                 "PhotoJig data",
-                "Main and Analysis scan date folders under the saved root path.",
+                "Main, Analysis and Report discover analysis folders under this root; Analysis also offers a date filter.",
             ),
             (
                 "Default model",
@@ -135,7 +166,9 @@ class SettingsTab(ttk.Frame):
             ),
         ]
         for index, (label, text) in enumerate(rows):
-            ttk.Label(notes, text=label, font=("TkDefaultFont", 10, "bold"), width=18).grid(
+            ttk.Label(
+                notes, text=label, font=("TkDefaultFont", 10, "bold"), width=18
+            ).grid(
                 row=index,
                 column=0,
                 sticky=tk.NW,
@@ -164,13 +197,15 @@ class SettingsTab(ttk.Frame):
 
     def _browse_root_path(self) -> None:
         initial = self._root_path_var.get().strip()
-        options = {"parent": self, "title": "Select PhotoJig root path"}
+        options = {"parent": self, "title": "Select workspace root folder"}
         if initial and Path(initial).is_dir():
             options["initialdir"] = initial
         folder = filedialog.askdirectory(**options)
         if folder:
             self._root_path_var.set(folder)
-            self._db_path_var.set(str(self._db_path_for_root(folder, self._read_config())))
+            self._db_path_var.set(
+                str(self._db_path_for_root(folder, self._read_config()))
+            )
 
     def _browse_model_path(self) -> None:
         initial = self._resolved_model_path(self._model_path_var.get().strip())
@@ -193,6 +228,9 @@ class SettingsTab(ttk.Frame):
             return
 
         path = Path(root_path).expanduser()
+        if path.exists() and not path.is_dir():
+            messagebox.showerror("Settings", "Root folder must be a directory.")
+            return
         if not path.exists():
             create = messagebox.askyesno(
                 "Settings",
@@ -221,11 +259,17 @@ class SettingsTab(ttk.Frame):
         try:
             saved_root_path = str(path.resolve())
             saved_model_path = self._model_path_for_save(model_path)
-            self._replace_config_value("app", "root_path", saved_root_path)
-            self._replace_config_value("ml", "model_path", saved_model_path)
+            self._replace_config_values(
+                {
+                    ("app", "root_path"): saved_root_path,
+                    ("ml", "model_path"): saved_model_path,
+                }
+            )
             self._root_path_var.set(saved_root_path)
             self._model_path_var.set(saved_model_path)
-            self._db_path_var.set(str(self._db_path_for_root(saved_root_path, self._read_config())))
+            self._db_path_var.set(
+                str(self._db_path_for_root(saved_root_path, self._read_config()))
+            )
             self._model_combo["values"] = list_model_options(self._config_path)
             self._refresh_model_status()
         except Exception as exc:
@@ -241,32 +285,43 @@ class SettingsTab(ttk.Frame):
             return yaml.safe_load(fh) or {}
 
     def _replace_config_value(self, section: str, key: str, value: str) -> None:
+        self._replace_config_values({(section, key): value})
+
+    def _replace_config_values(self, changes: dict[tuple[str, str], str]) -> None:
         text = self._config_path.read_text(encoding="utf-8-sig")
-        lines = text.splitlines(keepends=True)
-        in_section = False
-        replaced = False
-        output: list[str] = []
-
-        for line in lines:
-            stripped = line.strip().lstrip("\ufeff")
-            if re.match(rf"^{re.escape(section)}\s*:", stripped):
-                in_section = True
-                output.append(line)
-                continue
-            if in_section and line and not line.startswith((" ", "\t")) and stripped:
-                in_section = False
-            if in_section and re.match(rf"^\s*{re.escape(key)}\s*:", line):
-                indent = line[: len(line) - len(line.lstrip())]
-                newline = "\r\n" if line.endswith("\r\n") else "\n"
-                escaped = value.replace("'", "''")
-                output.append(f"{indent}{key}: '{escaped}'{newline}")
-                replaced = True
-                continue
-            output.append(line)
-
-        if not replaced:
-            raise RuntimeError(f"{section}.{key} entry was not found in config.")
-        self._config_path.write_text("".join(output), encoding="utf-8")
+        for (section, key), value in changes.items():
+            in_section = False
+            replaced = False
+            output: list[str] = []
+            for line in text.splitlines(keepends=True):
+                stripped = line.strip()
+                if re.match(rf"^{re.escape(section)}\s*:", line):
+                    in_section = True
+                    output.append(line)
+                    continue
+                if (
+                    in_section
+                    and not line.startswith((" ", "\t"))
+                    and stripped
+                    and not stripped.startswith("#")
+                ):
+                    in_section = False
+                if in_section and re.match(rf"^\s+{re.escape(key)}\s*:", line):
+                    indent = line[: len(line) - len(line.lstrip())]
+                    escaped = value.replace("'", "''")
+                    output.append(f"{indent}{key}: '{escaped}'\n")
+                    replaced = True
+                else:
+                    output.append(line)
+            if not replaced:
+                raise RuntimeError(f"{section}.{key} entry was not found in config.")
+            text = "".join(output)
+        parsed = yaml.safe_load(text)
+        if any(
+            parsed[section][key] != value for (section, key), value in changes.items()
+        ):
+            raise RuntimeError("Updated config did not preserve the requested values.")
+        atomic_write_text(self._config_path, text)
 
     def _resolved_model_path(self, value: str) -> Path:
         return resolve_model_path(value) if value else project_root() / "models"

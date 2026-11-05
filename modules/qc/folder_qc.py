@@ -1,3 +1,4 @@
+from modules.utils.analysis_id import compile_cell_pattern
 import re
 import logging
 from dataclasses import dataclass, field
@@ -58,6 +59,10 @@ class FolderQC:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def validate_path(self, analysis_path: str | Path, force: bool = False) -> FolderQCResult:
+        path = Path(analysis_path)
+        return self.validate(path.parent, "", path.name, force=force)
+
     def validate(
         self,
         root_path: str | Path,
@@ -93,7 +98,7 @@ class FolderQC:
             )
 
         # ── Step 2: AnalysisID format ────────────────────────────────────────
-        if not self._validate_date_name(date_str):
+        if date_str and not self._validate_date_name(date_str):
             reason = (
                 f"Date folder format mismatch: '{date_str}'  "
                 f"(allowed: YYYY-MM-DD, M-D-YYYY, M-D-YY)"
@@ -274,7 +279,7 @@ class FolderQC:
         Return list of (cell_name, cell_path) tuples.
         If no Cell #N subfolders found → single-cell mode: [(''single'', analysis_path)].
         """
-        pattern = re.compile(self._cfg["cell_folder_pattern"], re.IGNORECASE)
+        pattern = compile_cell_pattern(self._cfg["cell_folder_pattern"])
         cell_dirs = sorted(
             [d for d in analysis_path.iterdir() if d.is_dir() and pattern.match(d.name)],
             key=lambda d: d.name.lower(),

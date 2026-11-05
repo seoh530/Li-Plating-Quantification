@@ -33,8 +33,18 @@ def _suppress_stderr():
 
 
 def quiet_imread(path: str | Path, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarray | None:
-    with _suppress_stderr():
-        return cv2.imread(str(path), flags)
+    # Python handles Unicode Windows paths; OpenCV decodes the bytes only.
+    # Do not redirect process-wide stderr from GUI worker threads.
+    try:
+        payload = np.fromfile(Path(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if not payload.size:
+        return None
+    try:
+        return cv2.imdecode(payload, flags)
+    except cv2.error:
+        return None
 
 
 def atomic_imwrite_png(
@@ -75,3 +85,18 @@ def atomic_imwrite_png(
     if last_error is not None:
         raise last_error
     return False
+
+
+def atomic_write_text(path: str | Path, text: str) -> None:
+    """Replace a complete text file without exposing a truncated CSV/config."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)

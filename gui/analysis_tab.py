@@ -16,6 +16,7 @@ try:
 except ImportError:  # pragma: no cover - depends on deployment package.
     ImageGrab = None
 
+from modules.report.report_data import analysis_paths
 from modules.utils.analysis_id import (
     find_test_source_folders,
     get_test_mask_folder_for_pass,
@@ -129,14 +130,15 @@ class AnalysisTab(ttk.Frame):
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=0)
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(1, weight=1)
-        self.rowconfigure(2, weight=0)
+        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=0)
 
-        header = ttk.Frame(self)
-        header.grid(row=0, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(10, 6))
+        ttk.Label(self,text="Analysis",font=("Segoe UI",19,"bold")).grid(row=0,column=0,columnspan=2,sticky=tk.W,padx=24,pady=(18,14))
+        header = ttk.Frame(self,style="Card.TFrame",padding=(12,8))
+        header.grid(row=1, column=0, columnspan=2, sticky=tk.EW, padx=24, pady=(0,12))
         header.columnconfigure(4, weight=1)
 
-        ttk.Label(header, text="Date").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
+        ttk.Label(header, text="Scope",style="Panel.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
         self._date_var = tk.StringVar()
         self._date_combo = ttk.Combobox(
             header,
@@ -147,7 +149,7 @@ class AnalysisTab(ttk.Frame):
         self._date_combo.grid(row=0, column=1, sticky=tk.W)
         self._date_combo.bind("<<ComboboxSelected>>", self._on_date_change)
 
-        ttk.Label(header, text="View").grid(row=0, column=2, sticky=tk.W, padx=(10, 6))
+        ttk.Label(header, text="View",style="Panel.TLabel").grid(row=0, column=2, sticky=tk.W, padx=(10, 6))
         self._face_mode_var = tk.StringVar(value="FRONT")
         self._face_mode_combo = ttk.Combobox(
             header,
@@ -171,11 +173,11 @@ class AnalysisTab(ttk.Frame):
         ttk.Button(header, text="Capture screen", command=self._capture_screen).grid(
             row=0, column=7, sticky=tk.W, padx=(8, 0)
         )
-        self._status_label = ttk.Label(header, text="", foreground=_C_MUTED)
+        self._status_label = ttk.Label(header, text="",style="Panel.TLabel", foreground=_C_MUTED)
         self._status_label.grid(row=0, column=8, sticky=tk.W, padx=(12, 0))
 
         left = ttk.LabelFrame(self, text="ML Results", padding=8)
-        left.grid(row=1, column=0, sticky=tk.NS, padx=(10, 6), pady=(0, 8))
+        left.grid(row=2, column=0, sticky=tk.NS, padx=(24, 8), pady=(0, 8))
         left.rowconfigure(0, weight=1)
 
         columns = ("analysis_id", "cell", "result")
@@ -201,7 +203,7 @@ class AnalysisTab(ttk.Frame):
         self._result_tree.configure(yscrollcommand=tree_scroll.set)
 
         graph_frame = ttk.LabelFrame(self, text="Analysis view", padding=8)
-        graph_frame.grid(row=1, column=1, sticky=tk.NSEW, padx=(6, 10), pady=(0, 8))
+        graph_frame.grid(row=2, column=1, sticky=tk.NSEW, padx=(8, 24), pady=(0, 8))
         graph_frame.columnconfigure(0, weight=1)
         graph_frame.rowconfigure(0, weight=1)
 
@@ -250,7 +252,7 @@ class AnalysisTab(ttk.Frame):
         self._heatmap_canvas.bind("<Configure>", lambda _event: self._redraw_heatmap())
 
         images = ttk.LabelFrame(self, text="Selected layer images", padding=8)
-        images.grid(row=2, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(0, 10))
+        images.grid(row=3, column=0, columnspan=2, sticky=tk.EW, padx=24, pady=(0, 10))
         images.columnconfigure(0, weight=1)
         images.columnconfigure(1, weight=1)
 
@@ -278,9 +280,9 @@ class AnalysisTab(ttk.Frame):
         self._load_dates()
 
     def _load_dates(self) -> None:
-        self._date_values = self._list_date_folders()
+        self._date_values = ["All folders", *self._list_date_folders()]
         self._date_combo["values"] = self._date_values
-        selected = self._pick_default_date(self._date_values)
+        selected = self._date_var.get() if self._date_var.get() in self._date_values else "All folders"
         self._date_var.set(selected)
         self._load_results()
 
@@ -365,7 +367,7 @@ class AnalysisTab(ttk.Frame):
         self._clear_images()
 
         date_name = self._date_var.get().strip()
-        date_path = self._root_path / date_name if date_name else None
+        date_path = self._root_path if date_name == "All folders" else self._root_path / date_name if date_name else None
         if date_path is None or not date_path.is_dir():
             self._status_label.config(text="No date selected")
             self._redraw_graph()
@@ -387,13 +389,7 @@ class AnalysisTab(ttk.Frame):
 
     def _discover_result_options(self, date_name: str, date_path: Path) -> list[_ResultOption]:
         options: list[_ResultOption] = []
-        for analysis_path in sorted(
-            [
-                p for p in date_path.iterdir()
-                if p.is_dir() and self._is_analysis_folder(p.name)
-            ],
-            key=lambda p: p.name,
-        ):
+        for analysis_path in analysis_paths(date_path,self._analysis_id_re.pattern):
             csv_path = self._find_result_csv(analysis_path, analysis_path.name)
             if csv_path is None:
                 continue
@@ -407,7 +403,7 @@ class AnalysisTab(ttk.Frame):
             numeric_cells = pd.to_numeric(frame["Cell"], errors="coerce")
             cells = sorted({int(value) for value in numeric_cells.dropna().unique()})
             for cell in cells:
-                key = f"{date_name}|{analysis_path.name}|{cell}|{csv_path.name}"
+                key = f"{analysis_path.resolve()}|{cell}|{csv_path.name}"
                 result_summary = self._cell_result_summary(frame, cell)
                 options.append(
                     _ResultOption(
@@ -436,20 +432,9 @@ class AnalysisTab(ttk.Frame):
         if cell_frame.empty:
             return "Li - / Nonactive -"
 
-        included_rows: list[pd.Series] = []
-        for _face, face_frame in cell_frame.groupby("Face"):
-            face_frame = face_frame.copy()
-            face_frame["ImageNum"] = pd.to_numeric(face_frame["ImageNum"], errors="coerce")
-            face_frame = face_frame.dropna(subset=["ImageNum"])
-            ordered = face_frame.sort_values("ImageNum")
-            if str(_face).upper() == "TEST":
-                included_rows.extend(row for _, row in ordered.iterrows())
-                continue
-            if len(ordered) > 2:
-                included_rows.extend(row for _, row in ordered.iloc[1:-1].iterrows())
-
-        if not included_rows:
-            included_rows = [row for _, row in cell_frame.iterrows()]
+        # QC/ML already selects the included layers. Do not trim the saved
+        # result rows again, or this summary diverges from CSV/graph values.
+        included_rows = [row for _, row in cell_frame.iterrows()]
 
         li_values = [
             self._ratio_to_percent(float(row["li_salt_ratio"]))

@@ -6,10 +6,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from modules.utils.image_io import atomic_write_text, quiet_imread
+from modules.ml.developer_training import annotation_frame
+from modules.ml.feature_extractor import FeatureExtractor
 
 DEFAULT_LABELED_ROOT = PROJECT_ROOT / "data" / "labeled"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -18,6 +23,7 @@ CSV_HEADER = [
     "x",
     "y",
     "label",
+    *FeatureExtractor.ENHANCED_FEATURE_COLUMNS,
 ]
 
 idx = 0
@@ -46,6 +52,8 @@ BRUSH_RADIUS = 4
 BRUSH_POINT_COUNT = 10
 window_name = "Label Points (b/l/n)"
 output_csv: Path | None = None
+_label_source_image = None
+_label_extractor = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,11 +84,14 @@ def parse_args() -> argparse.Namespace:
         help="Append to an existing CSV instead of starting a fresh file.",
     )
     parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Explicitly replace an existing label CSV. Cannot be used with --append.",
+    )
+    parser.add_argument(
         "--config",
         default="config/thresholds.yaml",
         help=(
-            "Accepted for compatibility. Enhanced features are generated separately "
-            "with tools/enhance_training_features.py."
+            "Configuration used for automatic enhanced-feature CSV saving."
         ),
     )
     return parser.parse_args()
@@ -132,7 +143,7 @@ def default_output_csv_for_image_folder(image_folder: Path) -> Path:
     face = face_from_folder(image_folder)
 
     if analysis_root is None or face is None:
-        return DEFAULT_LABELED_ROOT / "spectrum_data.csv"
+        return DEFAULT_LABELED_ROOT / "enhanced_spectrum_data.csv"
 
     relative_parts = image_folder.relative_to(analysis_root).parts
     cell_number = cell_number_from_parts(relative_parts)
@@ -140,7 +151,7 @@ def default_output_csv_for_image_folder(image_folder: Path) -> Path:
         csv_name = f"{analysis_root.name}_{face}.csv"
     else:
         csv_name = f"{analysis_root.name}_{cell_number}_{face}.csv"
-    return analysis_root / csv_name
+    return analysis_root / ("enhanced_" + csv_name)
 
 
 def folder_contains_images(folder_path: Path) -> bool:
@@ -220,16 +231,23 @@ def image_label_for_csv(image_path: Path, csv_path: Path) -> str:
         return image_path.name
 
 
-def initialize_output_csv(csv_path: Path, append: bool) -> None:
+def initialize_output_csv(csv_path: Path, append: bool, overwrite: bool = False) -> None:
+    if append and overwrite:
+        raise RuntimeError("--append and --overwrite cannot be used together.")
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     if append and csv_path.exists():
         with open(csv_path, "r", newline="", encoding="utf-8") as fh:
             existing_header = next(csv.reader(fh), [])
         if existing_header != CSV_HEADER:
             raise RuntimeError(
-                f"Existing CSV header does not match basic label format: {csv_path}"
+                f"Existing CSV uses a legacy or incompatible header. Start a new enhanced CSV, or migrate it once with enhance_training_features.py: {csv_path}"
             )
         return
+    if csv_path.exists() and not overwrite:
+        raise RuntimeError(
+            f"Label CSV already exists: {csv_path}. Use --append to add labels "
+            "or --overwrite to explicitly replace it."
+        )
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(CSV_HEADER)
@@ -252,9 +270,14 @@ def flush_pending_rows():
     if output_csv is None:
         raise RuntimeError("output_csv is not initialized")
 
-    with open(output_csv, "a", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerows(pending_rows)
+    frame = annotation_frame(
+        _label_source_image, [(row[1], row[2], row[3]) for row in pending_rows],
+        pending_rows[0][0], _label_extractor,
+    )
+    existing = pd.read_csv(output_csv)
+    merged = frame if existing.empty else pd.concat([existing, frame], ignore_index=True)
+    merged = merged.drop_duplicates(['filename', 'x', 'y'], keep='last')
+    atomic_write_text(output_csv, merged.loc[:, CSV_HEADER].to_csv(index=False, float_format='%.17g'))
 
     pending_rows = []
 
@@ -279,6 +302,8 @@ def add_point(
     if not (0 <= xo < width and 0 <= yo < height):
         return
 
+    if _label_source_image is not None and _label_source_image.shape[2] == 4 and _label_source_image[yo, xo, 3] == 0:
+        return
     key = (filename, xo, yo, label)
     if key in saved_points:
         return
@@ -451,13 +476,15 @@ def run_labeling(
     csv_path: Path,
     append: bool,
     config_path: str | Path = "config/thresholds.yaml",
+    overwrite: bool = False,
 ) -> None:
-    global idx, current_label, output_csv
+    global idx, current_label, output_csv, _label_source_image, _label_extractor
     output_csv = csv_path
-    initialize_output_csv(csv_path, append=append)
+    _label_extractor = FeatureExtractor(resolve_config_path(config_path))
     images = collect_images(image_folder)
     if not images:
         raise RuntimeError(f"No images found in: {image_folder}")
+    initialize_output_csv(csv_path, append=append, overwrite=overwrite)
 
     print(f"Image folder: {image_folder}")
     print(f"Output CSV:   {csv_path}")
@@ -467,12 +494,13 @@ def run_labeling(
     while idx < len(images):
         path = images[idx]
         filename = image_label_for_csv(path, csv_path)
-        img_orig = cv2.imread(str(path))
+        img_orig = quiet_imread(path, cv2.IMREAD_COLOR)
         if img_orig is None:
             print(f"Failed to load image: {path.name}")
             idx += 1
             continue
 
+        _label_source_image = quiet_imread(path, cv2.IMREAD_UNCHANGED)
         reset_image_state()
 
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
@@ -520,7 +548,10 @@ def main() -> None:
     if not csv_path.is_absolute():
         csv_path = PROJECT_ROOT / csv_path
     try:
-        run_labeling(image_folder, csv_path, append=bool(args.append), config_path=args.config)
+        run_labeling(
+            image_folder, csv_path, append=bool(args.append),
+            config_path=args.config, overwrite=bool(args.overwrite),
+        )
     except RuntimeError as exc:
         print(f"Error: {exc}")
         sys.exit(1)

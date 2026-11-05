@@ -92,8 +92,11 @@ class FeatureExtractor:
         robust_eps: float | None = None,
         mm_per_pixel: float | None = None,
         edge_band_mm: float | None = None,
+        feature_config: dict | None = None,
     ) -> None:
         cfg = self._load_feature_config(config_path)
+        # Persisted training parameters take precedence over mutable UI config.
+        cfg.update(feature_config or {})
         self.local_residual_sigma_px = float(
             local_residual_sigma_px
             if local_residual_sigma_px is not None

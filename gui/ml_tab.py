@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import json
 import queue
 import re
@@ -29,7 +29,7 @@ from modules.utils.analysis_id import (
     get_test_output_folders,
     is_test_analysis_id,
 )
-from modules.utils.image_io import quiet_imread
+from modules.utils.image_io import atomic_write_text, quiet_imread
 
 logger = logging.getLogger(__name__)
 
@@ -632,6 +632,7 @@ class MLTab(ttk.Frame):
         self,
         tasks_by_key: dict[str, list[_ImageTask]],
     ) -> set[tuple[str, str]]:
+        self._db_replace_pairs: set[tuple[str, str]] = set()
         pairs = {
             (task.analysis_id, str(task.cell))
             for tasks in tasks_by_key.values()
@@ -652,12 +653,12 @@ class MLTab(ttk.Frame):
             "Monitoring DB already has rows for these AnalysisID + Cell pairs:\n\n"
             f"{preview}\n\n"
             "Replace existing SQLite monitoring rows for these pairs?\n\n"
-            "Yes: delete old DB rows and insert new monitoring rows.\n"
+            "Yes: replace old DB rows after successful analysis.\n"
             "No: keep old DB rows and skip new DB inserts for these pairs.\n\n"
             "CSV and mask outputs are not affected.",
         )
         if replace:
-            self._sqlite_logger.delete_prediction_cells(existing)
+            self._db_replace_pairs = existing
             return set()
         return existing
 
@@ -980,6 +981,7 @@ class MLTab(ttk.Frame):
                     rows,
                     force_run=force_run,
                 )
+                completed_records = []
                 for monitoring_row in monitoring_rows:
                     pair = (
                         str(monitoring_row.get("analysis_id", "")),
@@ -988,7 +990,10 @@ class MLTab(ttk.Frame):
                     if pair in db_skip_pairs:
                         continue
                     monitoring_row["csv_path"] = str(csv_path)
-                    self._sqlite_logger.insert_prediction_run(monitoring_row)
+                    completed_records.append(monitoring_row)
+                self._sqlite_logger.save_prediction_batch(
+                    completed_records, replace_pairs=self._db_replace_pairs
+                )
                 self._queue.put(("analysis_done", (option.run_key, csv_path)))
 
             self._queue.put(("done", total_images))
@@ -1003,11 +1008,7 @@ class MLTab(ttk.Frame):
 
     def _predict_image(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
         started = time.perf_counter()
-        feature_batch = self._feature_extractor.extract(
-            image,
-            downsample_factor=self._inference.downsample_factor,
-            feature_columns=self._inference.feature_columns,
-        )
+        feature_batch = self._inference.extract_features(image)
         extract_elapsed = time.perf_counter() - started
         predict_started = time.perf_counter()
         try:
@@ -1285,9 +1286,6 @@ class MLTab(ttk.Frame):
         average_percent = self._compute_average_li_salt_percent(tasks, rows)
         csv_name = f"{analysis_id}_LI-SALT_{average_percent:.2f}%.csv"
         csv_path = tasks[0].analysis_path / csv_name
-        if force_run:
-            self._delete_existing_result_csvs(tasks[0].analysis_path, analysis_id)
-
         frame = pd.DataFrame(
             rows,
             columns=[
@@ -1304,7 +1302,12 @@ class MLTab(ttk.Frame):
                 "issueNote",
             ],
         )
-        frame.to_csv(csv_path, index=False, float_format="%.3f")
+        atomic_write_text(csv_path, frame.to_csv(index=False, float_format="%.17g"))
+        # Old results are removed only once the new CSV is safely saved.
+        if force_run:
+            self._delete_existing_result_csvs(
+                tasks[0].analysis_path, analysis_id, keep=csv_path
+            )
         return csv_path
 
     def _issue_info_for_task(self, task: _ImageTask) -> dict:
@@ -1361,13 +1364,17 @@ class MLTab(ttk.Frame):
         except ValueError:
             return path.name
 
-    def _delete_existing_result_csvs(self, analysis_path: Path, analysis_id: str) -> None:
+    def _delete_existing_result_csvs(
+        self, analysis_path: Path, analysis_id: str, *, keep: Path | None = None
+    ) -> None:
         old_path = analysis_path / _RESULT_PATTERN_OLD.format(analysis_id=analysis_id)
         candidates = [old_path]
         candidates.extend(
             sorted(analysis_path.glob(_RESULT_PATTERN_NEW.format(analysis_id=analysis_id)))
         )
         for path in candidates:
+            if path == keep:
+                continue
             if not path.exists() or not path.is_file():
                 continue
             try:
@@ -1385,23 +1392,11 @@ class MLTab(ttk.Frame):
             for row in rows
         }
 
-        included_values: list[float] = []
-        grouped: dict[tuple[int, str], list[_ImageTask]] = {}
-        for task in tasks:
-            grouped.setdefault((task.cell, task.face), []).append(task)
-
-        for group_tasks in grouped.values():
-            ordered = sorted(group_tasks, key=lambda task: task.image_num)
-            if all(task.face.upper() == "TEST" for task in ordered):
-                for task in ordered:
-                    row = row_map[(task.cell, task.face, task.image_num)]
-                    included_values.append(float(row["li_salt_ratio"]) * 100.0)
-                continue
-            if len(ordered) <= 2:
-                continue
-            for task in ordered[1:-1]:
-                row = row_map[(task.cell, task.face, task.image_num)]
-                included_values.append(float(row["li_salt_ratio"]) * 100.0)
+        # Tasks have already excluded the source sheets omitted by QC/ML.
+        included_values = [
+            float(row_map[(task.cell, task.face, task.image_num)]["li_salt_ratio"]) * 100.0
+            for task in tasks
+        ]
 
         if not included_values:
             return 0.0

@@ -49,7 +49,7 @@ crop_engine:
   crop_angle_tolerance: 4.0
   size_deviation: 0.02
   pixel_count_deviation: 0.10
-  crop_padding_px: 30
+  crop_padding_px: 5
   source_edge_margin_px: 3
   source_edge_contact_min_px: 25
   paper_mask_hsv:
@@ -101,6 +101,7 @@ ml:
     upper: [179, 164, 155]
   edge_margin_px: 25
   training:
+    validation_group_by: cell
     validation_fraction: 0.2
     num_boost_round: 300
     learning_rate: 0.03

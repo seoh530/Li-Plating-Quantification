@@ -18,6 +18,7 @@ import yaml
 from modules.qc.folder_qc import FolderQC, FolderQCResult
 from modules.qc.crop_engine import CropEngine, CropResult
 from modules.qc.retake_manager import RetakeManager, RetakeItem
+from modules.utils.image_io import quiet_imread
 from modules.utils.analysis_id import (
     build_test_output_name,
     ensure_test_output_folders,
@@ -1602,7 +1603,7 @@ class QCTab(ttk.Frame):
             return
 
         _state, item = selected
-        image = cv2.imread(str(item.image_path), cv2.IMREAD_UNCHANGED)
+        image = quiet_imread(item.image_path, cv2.IMREAD_UNCHANGED)
         if image is None:
             self._review_canvas.create_text(
                 width / 2, height / 2, text="Failed to load image.", fill=_C_MUTED

@@ -1,5 +1,7 @@
+from modules.utils.analysis_id import compile_cell_pattern
 import logging
 import re
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +34,7 @@ REPORT_SOURCES = (REPORT_SOURCE_PASS, REPORT_SOURCE_MASK)
 
 @dataclass(frozen=True)
 class ReportImage:
-    path: Path
+    path: Path | None
     layer_number: int
 
 
@@ -74,10 +76,7 @@ class ReportCombiner:
         self.root_path = Path(cfg["app"]["root_path"])
         folder_cfg = cfg["folder_qc"]
         self._date_formats = list(folder_cfg["date_formats"])
-        self._cell_folder_re = re.compile(
-            folder_cfg.get("cell_folder_pattern", r"^cell\s*#\d+$"),
-            re.IGNORECASE,
-        )
+        self._cell_folder_re = compile_cell_pattern(folder_cfg.get("cell_folder_pattern", r"^cell\s*#\d+$"))
         self._image_count_rules = dict(folder_cfg.get("image_count_rules", {}))
         self._folder_qc = FolderQC(self._config_path)
         self._crop_engine = CropEngine(self._config_path)
@@ -431,7 +430,14 @@ class ReportCombiner:
         mask_paths = self._mask_pngs(mask_folder)
         if not mask_paths:
             raise FileNotFoundError(f"{cell_name} {face}_mask PNG files missing.")
-        self._validate_source_count(analysis_id, face, mask_paths)
+        # ML excludes the first and last source sheets; legacy exports may
+        # still contain all sheets. Neither count is a partial/failed export.
+        expected = self._expected_source_count(analysis_id)
+        if expected is not None and len(mask_paths) not in {expected, max(1, expected - 2)}:
+            raise ValueError(
+                f"{face} mask count mismatch: {len(mask_paths)} "
+                f"(expected: {expected} legacy or {max(1, expected - 2)} QC-filtered)"
+            )
 
         source_folder = self._find_face_folder(cell_path, face)
         layer_index = self._source_layer_index(source_folder) if source_folder else {}
@@ -508,21 +514,34 @@ class ReportCombiner:
             raise ValueError("Report grid must have at least one cell.")
 
         output_folder.mkdir(parents=True, exist_ok=True)
-        self._clear_previous_combined(output_folder, face)
-
         output_paths: list[Path] = []
-        for page_index, start in enumerate(range(0, len(images), per_page), start=1):
-            page_images = images[start : start + per_page]
-            canvas = self._render_page(page_images, columns, rows)
-            output_path = output_folder / f"{face}_combined_{page_index:02d}.png"
-            if not atomic_imwrite_png(output_path, canvas, compression=1):
-                raise RuntimeError(f"Failed to write combined image: {output_path}")
-            output_paths.append(output_path)
+        # Render every page before replacing any existing report. A corrupt
+        # later input must not erase the previous complete report.
+        with tempfile.TemporaryDirectory(prefix=".report_", dir=output_folder) as stage:
+            staged_paths: list[Path] = []
+            for page_index, start in enumerate(range(0, len(images), per_page), start=1):
+                page_images = images[start : start + per_page]
+                canvas = self._render_page(page_images, columns, rows)
+                name = f"{face}_combined_{page_index:02d}.png"
+                staged_path = Path(stage) / name
+                if not atomic_imwrite_png(staged_path, canvas, compression=1):
+                    raise RuntimeError(f"Failed to write combined image: {name}")
+                staged_paths.append(staged_path)
+            for staged_path in staged_paths:
+                output_path = output_folder / staged_path.name
+                staged_path.replace(output_path)
+                output_paths.append(output_path)
+        for old_path in output_folder.glob(f"{face}_combined_*.png"):
+            if old_path.is_file() and old_path not in output_paths:
+                old_path.unlink()
         return output_paths
 
     def _render_page(self, images: list[ReportImage], columns: int, rows: int) -> np.ndarray:
         loaded: list[tuple[ReportImage, np.ndarray]] = []
         for report_image in images:
+            if report_image.path is None:
+                loaded.append((report_image, None))
+                continue
             image = self._read_on_white(report_image.path)
             if image is None:
                 raise RuntimeError(f"Failed to read pass image: {report_image.path}")
@@ -531,9 +550,9 @@ class ReportCombiner:
         if loaded:
             ratios = [
                 image.shape[1] / max(image.shape[0], 1)
-                for _report_image, image in loaded
+                for _report_image, image in loaded if image is not None
             ]
-            target_ratio = float(np.median(ratios))
+            target_ratio = float(np.median(ratios)) if ratios else 1.25
         else:
             target_ratio = 1.25
 
@@ -555,6 +574,8 @@ class ReportCombiner:
             y = row * cell_h
             max_w = cell_w
             max_h = cell_h
+            if image is None:
+                continue
             img_h, img_w = image.shape[:2]
             scale = min(max_w / img_w, max_h / img_h)
             resized = cv2.resize(

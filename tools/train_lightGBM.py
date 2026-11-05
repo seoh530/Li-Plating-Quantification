@@ -2,7 +2,6 @@
 import json
 import logging
 import re
-import shutil
 import sys
 from pathlib import Path
 
@@ -12,6 +11,7 @@ import numpy as np
 import pandas as pd
 import yaml
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
+from sklearn.model_selection import GroupShuffleSplit
 
 # Run as: python tools/train_lightGBM.py
 # This script assumes the current working directory is the project root.
@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modules.ml.feature_extractor import FeatureExtractor
+from modules.ml.label_data import validate_label_rows, validation_groups
 from modules.ml.inference import (
     InferenceEngine,
     LABEL_BACKGROUND,
@@ -128,7 +129,7 @@ def resolve_config_path(config_path: str | Path) -> Path:
 
 
 def normalize_feature_set(feature_set: str | None) -> str:
-    normalized = str(feature_set or "basic").strip().lower()
+    normalized = str(feature_set or "enhanced").strip().lower()
     if normalized in {"basic", "enhanced"}:
         return normalized
     raise RuntimeError(f"Unsupported feature set: {feature_set}")
@@ -136,9 +137,9 @@ def normalize_feature_set(feature_set: str | None) -> str:
 
 def prompt_feature_set() -> str:
     while True:
-        raw = input("Select feature set [basic/enhanced] (default: basic): ").strip().lower()
+        raw = input("Select feature set [basic/enhanced] (default: enhanced): ").strip().lower()
         if not raw:
-            return "basic"
+            return "enhanced"
         if raw == "basic":
             return raw
         if raw == "enhanced":
@@ -189,12 +190,12 @@ def resolve_feature_set(args: argparse.Namespace, cfg: dict) -> str:
     configured = (
         cfg.get("ml", {})
         .get("feature_extraction", {})
-        .get("feature_set", "basic")
+        .get("feature_set", "enhanced")
     )
     try:
         return normalize_feature_set(str(configured).lower())
     except RuntimeError:
-        return "basic"
+        return "enhanced"
 
 
 def resolve_csv_selection(args: argparse.Namespace) -> str:
@@ -502,8 +503,7 @@ def overwrite_test_output_dir(test_dir: Path, model_dir: Path) -> Path:
     resolved_test = test_dir.resolve()
     if resolved_output == resolved_test or resolved_test not in resolved_output.parents:
         raise RuntimeError(f"Refusing to overwrite unsafe test output path: {output_dir}")
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
+    # Preserve unrelated files and prior masks if new inference fails.
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -531,7 +531,6 @@ def save_test_masks(
             logger.info("No test images found under %s; skipping test mask generation.", test_dir)
         return 0
 
-    extractor = FeatureExtractor(config_path)
     inference = InferenceEngine(config_path, model_path=model_dir)
     quantifier = Quantifier(config_path)
     saved_count = 0
@@ -542,11 +541,7 @@ def save_test_masks(
         if image is None:
             logger.warning("Skipping unreadable test image: %s", image_path)
             continue
-        feature_batch = extractor.extract(
-            image,
-            downsample_factor=inference.downsample_factor,
-            feature_columns=inference.feature_columns,
-        )
+        feature_batch = inference.extract_features(image)
         try:
             label_mask = inference.predict_mask(feature_batch)
         finally:
@@ -593,7 +588,7 @@ def load_training_frame(csv_files: list[Path]) -> pd.DataFrame:
     if invalid_labels:
         raise RuntimeError(f"Unsupported labels found: {invalid_labels}")
 
-    return data
+    return validate_label_rows(data)
 
 
 def select_feature_columns(data: pd.DataFrame, feature_set: str) -> list[str]:
@@ -643,6 +638,46 @@ def deterministic_validation_mask(labels: np.ndarray, validation_fraction: float
     if mask.all():
         raise RuntimeError("Training split is empty. Add more labeled data.")
     return mask
+
+
+def grouped_validation_mask(
+    labels: np.ndarray,
+    validation_fraction: float,
+    groups: np.ndarray,
+    seed: int = 0,
+) -> np.ndarray:
+    """Hold out whole cells/images, never neighboring labeled pixels."""
+    if not 0.0 < validation_fraction < 1.0:
+        raise RuntimeError("validation_fraction must be between 0 and 1.")
+    unique_groups, group_indices = np.unique(groups, return_inverse=True)
+    if len(unique_groups) < 2:
+        raise RuntimeError(
+            "Grouped validation needs at least two independent groups. Add more "
+            "cells, or explicitly set validation_group_by=image for an exploratory "
+            "image-level comparison (not a new-cell performance estimate)."
+        )
+    classes, class_indices = np.unique(labels, return_inverse=True)
+    group_counts = np.zeros((len(unique_groups), len(classes)), dtype=np.int64)
+    np.add.at(group_counts, (group_indices, class_indices), 1)
+    total_counts = group_counts.sum(axis=0)
+    splitter = GroupShuffleSplit(n_splits=128, test_size=validation_fraction, random_state=seed)
+    best = None
+    best_gap = float("inf")
+    for _train_groups, valid_groups in splitter.split(unique_groups, groups=unique_groups):
+        valid_counts = group_counts[valid_groups].sum(axis=0)
+        if np.any(valid_counts == 0) or np.any(total_counts - valid_counts == 0):
+            continue
+        gap = abs(valid_counts.sum() / len(labels) - validation_fraction)
+        if gap < best_gap:
+            best = valid_groups
+            best_gap = gap
+    if best is None:
+        raise RuntimeError(
+            "Cannot build a group-disjoint split with every labeled class in both "
+            "sets. Add independent labeled groups for rare classes. No pixel-level "
+            "fallback was used."
+        )
+    return np.isin(group_indices, best)
 
 
 def build_params(cfg: dict) -> tuple[dict, int, int]:
@@ -742,15 +777,22 @@ def main() -> None:
     if not model_name and not args.output_dir and sys.stdin.isatty():
         model_name = prompt_model_name()
     model_dir = resolve_model_dir(cfg, args.output_dir, feature_set, model_name)
+    if model_dir.exists() and any(model_dir.iterdir()):
+        raise RuntimeError(f"Model output folder is not empty: {model_dir}")
     data = load_training_frame(csv_files)
     feature_columns = select_feature_columns(data, feature_set)
 
     features = data.loc[:, feature_columns].to_numpy(dtype=np.float32, copy=True)
     labels = data["label"].map(TRAINING_LABEL_TO_CODE).to_numpy(dtype=np.int32)
 
-    validation_mask = deterministic_validation_mask(
+    training_cfg = cfg["ml"]["training"]
+    group_by = str(training_cfg.get("validation_group_by", "cell"))
+    groups = validation_groups(data, group_by)
+    validation_mask = grouped_validation_mask(
         labels,
-        float(cfg["ml"]["training"]["validation_fraction"]),
+        float(training_cfg["validation_fraction"]),
+        groups,
+        seed=int(training_cfg["seed"]),
     )
 
     x_train = features[~validation_mask]
@@ -809,6 +851,9 @@ def main() -> None:
                 "source_csvs": source_csvs,
                 "classes": ["b", "l", "n"],
                 "best_iteration": booster.best_iteration,
+                "validation_group_by": group_by,
+                "training_groups": sorted(set(groups[~validation_mask])),
+                "validation_groups": sorted(set(groups[validation_mask])),
             },
             indent=2,
         ),
